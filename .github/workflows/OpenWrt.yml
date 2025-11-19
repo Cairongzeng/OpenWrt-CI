@@ -6,7 +6,7 @@ on:
       source_branch:
         description: '源码分支'
         required: true
-        default: 'openwrt-24.10'
+        default: 'main'
         type: string
       target_arch:
         description: '设备架构'
@@ -23,6 +23,11 @@ on:
         required: false
         default: 'luci-app-upnp,luci-app-firewall,luci-app-wireguard'
         type: string
+      include_packages:
+        description: '自定义包列表（非LuCI，逗号分隔）'
+        required: false
+        default: 'iperf3,tcpdump,curl,wget,htop,nano'
+        type: string
       create_release:
         description: '发布到GitHub Release'
         required: false
@@ -38,246 +43,398 @@ on:
         required: false
         default: ''
         type: string
+      build_profile:
+        description: '构建配置'
+        required: false
+        default: 'standard'
+        type: choice
+        options:
+          - minimal
+          - standard
+          - full
+      kernel_modules:
+        description: '额外内核模块（逗号分隔）'
+        required: false
+        default: ''
+        type: string
+      include_chinese:
+        description: '包含中文语言支持'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  # 正确定义环境变量，避免后续步骤引用问题
+  TARGET_ARCH: ${{ github.event.inputs.target_arch }}
+  DEVICE_MODEL: ${{ github.event.inputs.device_model }}
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 4G
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 240
     
     steps:
-    - name: Checkout Source
+    - name: Checkout Source Code
       uses: actions/checkout@v4
       with:
-        repository: openwrt/openwrt
         ref: ${{ github.event.inputs.source_branch }}
         submodules: recursive
 
-    - name: Setup Environment
+    - name: Get Repository Metadata
+      id: repo_info
       run: |
-        sudo apt-get update
-        sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib \
-          gettext git libncurses5-dev libssl-dev python3 python3-pip \
-          python3-setuptools rsync unzip wget zlib1g-dev file time ccache \
-          python3-dev python3-wheel python3-venv
+        echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+        echo "branch=$(git branch --show-current 2>/dev/null || echo 'detached')" >> $GITHUB_OUTPUT
+        echo "tag=$(git describe --tags --abbrev=0 2>/dev/null || echo 'none')" >> $GITHUB_OUTPUT
 
-    - name: Validate Inputs
+    - name: Setup Build Environment
       run: |
-        if ! [[ "${{ github.event.inputs.target_arch }}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-          echo "❌ 设备架构包含无效字符"
-          exit 1
-        fi
-        if ! [[ "${{ github.event.inputs.device_model }}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-          echo "❌ 设备型号包含无效字符"
-          exit 1
-        fi
+        sudo apt-get update -q
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          build-essential \
+          clang \
+          flex \
+          bison \
+          g++ \
+          gawk \
+          gcc-multilib \
+          gettext \
+          git \
+          libncurses5-dev \
+          libssl-dev \
+          python3 \
+          python3-pip \
+          python3-setuptools \
+          python3-venv \
+          rsync \
+          unzip \
+          wget \
+          zlib1g-dev \
+          file \
+          time \
+          ccache \
+          python3-dev \
+          python3-wheel \
+          subversion \
+          libxml-parser-perl \
+          libjson-perl \
+          curl \
+          jq \
+          tree
 
-    - name: Cache Build Dependencies
+    - name: Prepare Build Directories
+      run: |
+        mkdir -p "${{ env.CCACHE_DIR }}"
+        mkdir -p dl build_dir staging_dir logs
+        chmod -R 755 "${{ env.CCACHE_DIR }}"
+
+    - name: Cache Build Artifacts
       uses: actions/cache@v4
       with:
         path: |
-          ~/.ccache
+          ${{ env.CCACHE_DIR }}
+          dl
           build_dir
           staging_dir
-          logs
-          dl
-        key: ${{ runner.os }}-openwrt-${{ github.event.inputs.source_branch }}-${{ github.event.inputs.target_arch }}-${{ github.sha }}
+        key: openwrt-build-${{ runner.os }}-${{ github.event.inputs.source_branch }}-${{ env.TARGET_ARCH }}-${{ env.DEVICE_MODEL }}-${{ steps.repo_info.outputs.sha }}
         restore-keys: |
-          ${{ runner.os }}-openwrt-${{ github.event.inputs.source_branch }}-${{ github.event.inputs.target_arch }}-
-          ${{ runner.os }}-openwrt-${{ github.event.inputs.source_branch }}-
-          ${{ runner.os }}-openwrt-
+          openwrt-build-${{ runner.os }}-${{ github.event.inputs.source_branch }}-${{ env.TARGET_ARCH }}-${{ env.DEVICE_MODEL }}-
+          openwrt-build-${{ runner.os }}-${{ github.event.inputs.source_branch }}-${{ env.TARGET_ARCH }}-
+          openwrt-build-${{ runner.os }}-${{ github.event.inputs.source_branch }}-
+          openwrt-build-${{ runner.os }}-
 
-    - name: Add Custom Feeds
-      if: ${{ github.event.inputs.custom_feeds != '' }}
+    - name: Setup Custom Package Feeds
+      if: github.event.inputs.custom_feeds != ''
       run: |
-        if [ -n "${{ github.event.inputs.custom_feeds }}" ]; then
-          echo "${{ github.event.inputs.custom_feeds }}" > /tmp/custom_feeds.txt
-          while IFS= read -r line; do
-            line_trimmed=$(echo "$line" | xargs)
-            if [ -n "$line_trimmed" ] && [[ $line_trimmed == *">"* ]]; then
-              echo "$line_trimmed" >> feeds.conf.default
+        echo "🔧 Setting up custom feeds..."
+        echo "${{ github.event.inputs.custom_feeds }}" | while IFS= read -r line; do
+          line_cleaned=$(echo "$line" | tr -d '\r' | sed 's/[^a-zA-Z0-9>._:-]//g')
+          if [ -n "$line_cleaned" ] && [[ $line_cleaned == *">"* ]]; then
+            feed_name=$(echo "$line_cleaned" | cut -d'>' -f1)
+            feed_url=$(echo "$line_cleaned" | cut -d'>' -f2-)
+            
+            # 严格验证HTTPS协议和证书有效性
+            if [[ $feed_url =~ ^https:// ]] && [ -n "$feed_name" ]; then
+              if curl -sI "$feed_url" | grep -q "HTTP/"; then
+                echo "Adding feed: $feed_name > $feed_url"
+                echo "$line_cleaned" >> feeds.conf.default
+              else
+                echo "⚠️ Skipping feed with invalid HTTPS certificate: $feed_url"
+              fi
+            else
+              echo "⚠️ Skipping non-HTTPS feed: $feed_url"
             fi
-          done < /tmp/custom_feeds.txt
-          rm -f /tmp/custom_feeds.txt
-          cat feeds.conf.default
-        fi
+          fi
+        done
 
-    - name: Update and Install Feeds
+    - name: Update Package Feeds
       run: |
-        ./scripts/feeds update -a || exit 1
-        ./scripts/feeds install -a || exit 1
+        echo "🔄 Updating package feeds..."
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
 
-    - name: Configure LuCI Components
-      id: configure_luci
+    - name: Install Required Packages
       run: |
-        CORE_PACKAGES=(
-          "luci" "luci-base" "luci-compat" 
-          "luci-lib-base" "luci-lib-ip" 
-          "luci-lib-jsonc" "luci-lib-nixio"
-        )
+        set -e
         
+        echo "📦 Installing core packages..."
+        CORE_PACKAGES=("luci" "luci-base" "luci-compat")
         for pkg in "${CORE_PACKAGES[@]}"; do
-          ./scripts/feeds install "$pkg" || true
+          if ! ./scripts/feeds install "$pkg"; then
+            echo "❌ Core package $pkg installation failed"
+            exit 1
+          fi
         done
         
-        ./scripts/feeds install luci-theme-bootstrap || true
-        ./scripts/feeds install luci-theme-argon || true
-        
-        APPS_COUNT=0
+        echo "📦 Installing optional packages..."
+        OPTIONAL_PACKAGES=("luci-theme-bootstrap" "luci-theme-argon")
+        for pkg in "${OPTIONAL_PACKAGES[@]}"; do
+          ./scripts/feeds install "$pkg" || echo "⚠️ Optional package $pkg installation failed"
+        done
+
         if [ -n "${{ github.event.inputs.include_luci_apps }}" ]; then
+          echo "📦 Installing LuCI applications..."
           IFS=',' read -ra APPS <<< "${{ github.event.inputs.include_luci_apps }}"
           for app in "${APPS[@]}"; do
-            app_trimmed=$(echo "$app" | xargs)
-            if [ -n "$app_trimmed" ]; then
-              if ./scripts/feeds install "$app_trimmed"; then
-                ((APPS_COUNT++))
-              fi
+            app_cleaned=$(echo "$app" | xargs | sed 's/[^a-zA-Z0-9_-]//g')
+            if [ -n "$app_cleaned" ]; then
+              ./scripts/feeds install "$app_cleaned" || echo "⚠️ LuCI app $app_cleaned installation failed"
             fi
           done
         fi
-        
-        echo "luci_apps_count=${APPS_COUNT}" >> $GITHUB_OUTPUT
 
-    - name: Configure Build
-      run: |
-        TARGET_ARCH="${{ github.event.inputs.target_arch }}"
-        DEVICE_MODEL="${{ github.event.inputs.device_model }}"
+        if [ "${{ github.event.inputs.include_chinese }}" = "true" ]; then
+          echo "🌐 Installing Chinese language support..."
+          ./scripts/feeds install luci-i18n-base-zh-cn || echo "⚠️ Chinese language pack installation failed"
+        fi
         
+        if [ -n "${{ github.event.inputs.include_packages }}" ]; then
+          echo "📦 Installing custom packages..."
+          IFS=',' read -ra PKGS <<< "${{ github.event.inputs.include_packages }}"
+          for pkg in "${PKGS[@]}"; do
+            pkg_cleaned=$(echo "$pkg" | xargs | sed 's/[^a-zA-Z0-9_-]//g')
+            if [ -n "$pkg_cleaned" ]; then
+              ./scripts/feeds install "$pkg_cleaned" || echo "⚠️ Custom package $pkg_cleaned installation failed"
+            fi
+          done
+        fi
+
+    - name: Generate Build Configuration
+      run: |
+        if ! command -v gettext > /dev/null 2>&1; then
+          sudo apt-get install -y gettext
+        fi
+        
+        # 直接生成配置文件，避免使用模板和sed替换
         cat > .config << EOF
-CONFIG_TARGET_${TARGET_ARCH}=y
-CONFIG_TARGET_${TARGET_ARCH}_${DEVICE_MODEL}=y
+# Target configuration
+CONFIG_TARGET_${{ env.TARGET_ARCH | tr '[:lower:]' '[:upper:]' | tr '.-' '_' }}=y
+CONFIG_TARGET_${{ env.TARGET_ARCH | tr '[:lower:]' '[:upper:]' | tr '.-' '_' }}_${{ env.DEVICE_MODEL | tr '[:lower:]' '[:upper:]' | tr '.-' '_' }}=y
+
+# Core packages
 CONFIG_PACKAGE_luci=y
 CONFIG_PACKAGE_luci-base=y
 CONFIG_PACKAGE_luci-compat=y
-CONFIG_PACKAGE_luci-lib-base=y
-CONFIG_PACKAGE_luci-lib-ip=y
-CONFIG_PACKAGE_luci-lib-jsonc=y
-CONFIG_PACKAGE_luci-lib-nixio=y
-CONFIG_PACKAGE_wpad-basic-wolfssl=y
-CONFIG_PACKAGE_iperf3=y
-CONFIG_PACKAGE_tcpdump=y
-CONFIG_CCACHE=y
 CONFIG_PACKAGE_luci-theme-bootstrap=y
 CONFIG_PACKAGE_luci-theme-argon=y
+CONFIG_PACKAGE_wpad-basic-wolfssl=y
+CONFIG_CCACHE=y
+
+# Essential tools
+CONFIG_PACKAGE_iperf3=y
+CONFIG_PACKAGE_tcpdump=y
+CONFIG_PACKAGE_curl=y
+CONFIG_PACKAGE_wget=y
+CONFIG_PACKAGE_htop=y
+CONFIG_PACKAGE_nano=y
 EOF
-        
+
+        # 动态添加额外配置
+        if [ "${{ github.event.inputs.include_chinese }}" = "true" ]; then
+          echo "CONFIG_PACKAGE_luci-i18n-base-zh-cn=y" >> .config
+        fi
+
         if [ -n "${{ github.event.inputs.include_luci_apps }}" ]; then
           IFS=',' read -ra APPS <<< "${{ github.event.inputs.include_luci_apps }}"
           for app in "${APPS[@]}"; do
-            app_trimmed=$(echo "$app" | xargs)
-            if [ -n "$app_trimmed" ]; then
-              echo "CONFIG_PACKAGE_${app_trimmed}=y" >> .config
+            app_cleaned=$(echo "$app" | xargs | sed 's/[^a-zA-Z0-9_-]//g')
+            if [ -n "$app_cleaned" ]; then
+              echo "CONFIG_PACKAGE_${app_cleaned}=y" >> .config
             fi
           done
         fi
+
+        if [ -n "${{ github.event.inputs.include_packages }}" ]; then
+          IFS=',' read -ra PKGS <<< "${{ github.event.inputs.include_packages }}"
+          for pkg in "${PKGS[@]}"; do
+            pkg_cleaned=$(echo "$pkg" | xargs | sed 's/[^a-zA-Z0-9_-]//g')
+            if [ -n "$pkg_cleaned" ]; then
+              echo "CONFIG_PACKAGE_${pkg_cleaned}=y" >> .config
+            fi
+          done
+        fi
+
+        if [ -n "${{ github.event.inputs.kernel_modules }}" ]; then
+          IFS=',' read -ra MODULES <<< "${{ github.event.inputs.kernel_modules }}"
+          for module in "${MODULES[@]}"; do
+            module_cleaned=$(echo "$module" | xargs | sed 's/[^a-zA-Z0-9_-]//g')
+            if [ -n "$module_cleaned" ]; then
+              echo "CONFIG_PACKAGE_kmod-${module_cleaned}=y" >> .config
+            fi
+          done
+        fi
+
+        if [ ! -s .config ]; then
+          echo "❌ Configuration file is empty"
+          exit 1
+        fi
         
+        if ! grep -q "CONFIG_TARGET_${{ env.TARGET_ARCH | tr '[:lower:]' '[:upper:]' | tr '.-' '_' }}=y" .config; then
+          echo "❌ Target configuration generation failed"
+          exit 1
+        fi
+
+        echo "✅ Configuration generated successfully"
         make defconfig
 
-    - name: Customize LuCI Configuration
-      run: |
-        mkdir -p files/etc/uci-defaults
-        
-        cat > files/etc/uci-defaults/99_luci-theme << 'EOF'
-#!/bin/sh
-[ -f /etc/config/luci ] || exit 0
-uci -q batch << EOI
-set luci.main.mediaurlbase='/luci-static/argon'
-commit luci
-EOI
-exit 0
-EOF
-        
-        chmod +x files/etc/uci-defaults/99_luci-theme
-
     - name: Build Firmware
-      id: build
-      continue-on-error: true
+      id: build_firmware
       run: |
-        export CCACHE_DIR="${{ github.workspace }}/.ccache"
-        export CCACHE_MAXSIZE=2G
-        export CCACHE_COMPRESS=1
-        mkdir -p "$CCACHE_DIR"
+        set +e
         
-        mkdir -p build-logs
-        
-        BUILD_START_TIME=$(date +%s)
+        BUILD_START=$(date +%s)
+        echo "🔨 Starting firmware build..."
         
         if [ "${{ github.event.inputs.verbose_build }}" = "true" ]; then
-          make -j$(nproc) V=s 2>&1 | tee build-logs/build.log
+          echo "📝 Verbose build enabled"
+          make -j$(nproc) V=s
         else
-          make -j$(nproc) 2>&1 | tee build-logs/build.log
+          make -j$(nproc)
         fi
         
         BUILD_EXIT_CODE=$?
-        BUILD_END_TIME=$(date +%s)
-        BUILD_DURATION=$((BUILD_END_TIME - BUILD_START_TIME))
+        BUILD_END=$(date +%s)
+        BUILD_DURATION=$((BUILD_END - BUILD_START))
+        
+        echo "build_duration=$BUILD_DURATION" >> $GITHUB_OUTPUT
+        echo "build_exit_code=$BUILD_EXIT_CODE" >> $GITHUB_OUTPUT
         
         if [ $BUILD_EXIT_CODE -eq 0 ]; then
           echo "build_status=success" >> $GITHUB_OUTPUT
-          echo "build_duration=${BUILD_DURATION}" >> $GITHUB_OUTPUT
+          echo "✅ Build completed successfully in ${BUILD_DURATION}s"
         else
-          echo "build_status=failure" >> $GITHUB_OUTPUT
-          echo "build_duration=${BUILD_DURATION}" >> $GITHUB_OUTPUT
-          exit $BUILD_EXIT_CODE
+          echo "build_status=failed" >> $GITHUB_OUTPUT
+          echo "❌ Build failed with exit code $BUILD_EXIT_CODE after ${BUILD_DURATION}s"
         fi
+        
+        exit $BUILD_EXIT_CODE
 
-    - name: Verify Build Output
-      if: steps.build.outputs.build_status == 'success'
+    - name: Monitor System Resources
+      if: always()
       run: |
+        echo "📊 Detailed System Resource Usage:"
+        echo "--- Disk Space ---"
+        df -h
+        echo "--- Memory Usage ---"
+        free -h
+        echo "--- CPU Usage ---"
+        top -bn1 | head -10
+        echo "--- CCache Statistics ---"
+        ccache -s 2>/dev/null || echo "CCache not available"
+
+    - name: Verify Build Artifacts
+      if: steps.build_firmware.outputs.build_status == 'success'
+      run: |
+        echo "🔍 Verifying build artifacts..."
+        
         if [ ! -d "bin/targets" ]; then
-          echo "❌ bin/targets 目录不存在"
+          echo "❌ Build output directory 'bin/targets' not found"
           exit 1
         fi
         
-        FIRMWARE_FILES=$(find bin/targets -type f \( -name "*.bin" -o -name "*.img" -o -name "*.tar" -o -name "*.gz" -o -name "*.trx" -o -name "*.elf" -o -name "*.ubi" -o -name "*.ubifs" -o -name "*.squashfs" -o -name "*.ext4" \) ! -name "*.sha256sums" ! -name "*.log" -size +1M 2>/dev/null || true)
-        FIRMWARE_COUNT=$(echo "$FIRMWARE_FILES" | grep -c . 2>/dev/null || echo 0)
+        FIRMWARE_FILES=$(find bin/targets -type f \( -name "*.bin" -o -name "*.img" -o -name "*.tar" \) -size +1M 2>/dev/null | head -10)
         
-        if [ $FIRMWARE_COUNT -eq 0 ]; then
-          echo "❌ 未找到任何固件文件"
-          find bin/targets -type f 2>/dev/null | head -20
+        if [ -z "$FIRMWARE_FILES" ]; then
+          echo "❌ No firmware files found"
+          echo "Available files in bin/targets:"
+          find bin/targets -type f | head -20
           exit 1
         fi
+        
+        echo "✅ Found firmware files:"
+        while IFS= read -r file; do
+          if [ -f "$file" ]; then
+            size=$(du -h "$file" | cut -f1)
+            checksum=$(sha256sum "$file" | cut -d' ' -f1 | head -c 16)
+            echo "  📄 $(basename "$file") ($size) [sha256:$checksum...]"
+          fi
+        done <<< "$FIRMWARE_FILES"
 
-    - name: Collect Error Logs
-      if: ${{ steps.build.outputs.build_status == 'failure' }}
-      run: |
-        mkdir -p error-logs
-        if [ -d "build-logs" ]; then
-          cp -r build-logs/ error-logs/ 2>/dev/null || true
-        fi
-        cp .config error-logs/ 2>/dev/null || true
-        cp feeds.conf.default error-logs/ 2>/dev/null || true
-
-    - name: Upload Error Logs
-      if: ${{ steps.build.outputs.build_status == 'failure' }}
+    - name: Upload Build Artifacts
+      if: steps.build_firmware.outputs.build_status == 'success'
       uses: actions/upload-artifact@v4
       with:
-        name: error-logs-${{ github.run_id }}
-        path: error-logs/
-        retention-days: 7
-
-    - name: Upload Artifacts
-      if: steps.build.outputs.build_status == 'success'
-      uses: actions/upload-artifact@v4
-      with:
-        name: openwrt-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}
+        name: openwrt-${{ env.TARGET_ARCH }}-${{ env.DEVICE_MODEL }}
         path: bin/targets/
-        retention-days: 7
+        retention-days: 30
+        compression-level: 0
 
-    - name: Create Release
-      if: ${{ github.event.inputs.create_release && steps.build.outputs.build_status == 'success' }}
+    - name: Create GitHub Release
+      if: github.event.inputs.create_release && steps.build_firmware.outputs.build_status == 'success'
       uses: ncipollo/release-action@v2
       with:
-        tag: openwrt-${{ github.event.inputs.source_branch }}-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}-${{ github.run_number }}
-        name: OpenWrt ${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}
+        tag: openwrt-${{ env.TARGET_ARCH }}-${{ env.DEVICE_MODEL }}-${{ github.run_number }}
+        name: OpenWrt ${{ env.TARGET_ARCH }}/${{ env.DEVICE_MODEL }} Build ${{ github.run_number }}
         body: |
-          构建信息:
-          - 源码分支: ${{ github.event.inputs.source_branch }}
-          - 设备架构: ${{ github.event.inputs.target_arch }}
-          - 设备型号: ${{ github.event.inputs.device_model }}
-          - LuCI应用: ${{ github.event.inputs.include_luci_apps }}
-          - 构建耗时: ${{ steps.build.outputs.build_duration }} 秒
-        artifacts: "bin/targets/**/*.bin,bin/targets/**/*.img,bin/targets/**/*.tar,bin/targets/**/*.gz,bin/targets/**/*.trx,bin/targets/**/*.elf,bin/targets/**/*.ubi,bin/targets/**/*.ubifs,bin/targets/**/*.squashfs,bin/targets/**/*.ext4"
+          # OpenWrt Firmware Build
+          
+          ## Build Information
+          - **Architecture**: ${{ env.TARGET_ARCH }}
+          - **Device Model**: ${{ env.DEVICE_MODEL }}
+          - **Source Branch**: ${{ github.event.inputs.source_branch }}
+          - **Build Duration**: ${{ steps.build_firmware.outputs.build_duration }} seconds
+          - **Build Profile**: ${{ github.event.inputs.build_profile }}
+          - **Chinese Support**: ${{ github.event.inputs.include_chinese }}
+          - **Build Date**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          
+          ## Included Packages
+          - **LuCI Applications**: ${{ github.event.inputs.include_luci_apps }}
+          - **Custom Packages**: ${{ github.event.inputs.include_packages }}
+          - **Kernel Modules**: ${{ github.event.inputs.kernel_modules }}
+          
+          ## Repository Information
+          - **Commit**: ${{ steps.repo_info.outputs.sha }}
+          - **Branch**: ${{ steps.repo_info.outputs.branch }}
+          - **Tag**: ${{ steps.repo_info.outputs.tag }}
+          
+          > Automatically built by GitHub Actions
+        artifacts: "bin/targets/**/*"
         draft: false
         prerelease: false
         allowUpdates: true
         token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Handle Build Failure
+      if: steps.build_firmware.outputs.build_status == 'failed'
+      run: |
+        echo "❌ Build failed after ${{ steps.build_firmware.outputs.build_duration }} seconds"
+        echo "Exit code: ${{ steps.build_firmware.outputs.build_exit_code }}"
+        
+        if [ -f "logs/build.log" ]; then
+          echo "Last 50 lines of build log:"
+          tail -50 logs/build.log
+        elif [ -d "logs" ]; then
+          echo "Available log files:"
+          find logs -type f -name "*.log" | head -10
+        fi
+        
+        echo "Remaining disk space:"
+        df -h .
+        
+        echo "💡 Next steps:"
+        echo "   - Check the build log above for errors"
+        echo "   - Verify your device configuration"
+        echo "   - Ensure all required packages are available"
+        echo "   - Try building with verbose output enabled"
