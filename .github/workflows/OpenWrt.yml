@@ -18,6 +18,25 @@ on:
         required: true
         default: 'an7581'
         type: string
+      enable_luci:
+        description: '启用 LuCI Web 界面'
+        required: false
+        default: true
+        type: boolean
+      luci_theme:
+        description: 'LuCI 主题'
+        required: false
+        default: 'bootstrap'
+        type: choice
+        options:
+          - bootstrap
+          - material
+          - argon
+      include_luci_apps:
+        description: '包含的 LuCI 应用 (逗号分隔)'
+        required: false
+        default: 'luci-app-upnp,luci-app-firewall,luci-app-wireguard'
+        type: string
       create_release:
         description: '发布到GitHub Release'
         required: false
@@ -68,13 +87,131 @@ jobs:
         echo "当前 feeds.conf.default 内容:"
         cat feeds.conf.default
 
+    - name: Configure LuCI Components
+      id: configure_luci
+      if: ${{ github.event.inputs.enable_luci }}
+      run: |
+        echo "配置 LuCI 组件..."
+        
+        # 更新并安装 feeds
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+        
+        # 安装 LuCI 核心包
+        ./scripts/feeds install luci
+        ./scripts/feeds install luci-base
+        ./scripts/feeds install luci-compat
+        ./scripts/feeds install luci-lib-base
+        ./scripts/feeds install luci-lib-ip
+        ./scripts/feeds install luci-lib-jsonc
+        ./scripts/feeds install luci-lib-nixio
+        
+        # 安装主题
+        if [ "${{ github.event.inputs.luci_theme }}" = "material" ]; then
+          echo "安装 Material 主题"
+          ./scripts/feeds install luci-theme-material
+        elif [ "${{ github.event.inputs.luci_theme }}" = "argon" ]; then
+          echo "安装 Argon 主题"
+          ./scripts/feeds install luci-theme-argon
+        else
+          echo "安装 Bootstrap 主题"
+          ./scripts/feeds install luci-theme-bootstrap
+        fi
+        
+        # 安装用户指定的 LuCI 应用
+        IFS=',' read -ra APPS <<< "${{ github.event.inputs.include_luci_apps }}"
+        for app in "${APPS[@]}"; do
+          app_trimmed=$(echo "$app" | xargs)
+          if [ -n "$app_trimmed" ]; then
+            echo "安装 LuCI 应用: $app_trimmed"
+            ./scripts/feeds install "$app_trimmed" || echo "安装 $app_trimmed 失败，继续..."
+          fi
+        done
+        
+        echo "luci_theme=${{ github.event.inputs.luci_theme }}" >> $GITHUB_OUTPUT
+        echo "luci_apps_count=${#APPS[@]}" >> $GITHUB_OUTPUT
+
     - name: Configure Build
       run: |
         ./scripts/feeds update -a
         ./scripts/feeds install -a
+        
+        # 基础配置
         echo "CONFIG_TARGET_${{ github.event.inputs.target_arch }}=y" > .config
         echo "CONFIG_TARGET_${{ github.event.inputs.target_arch }}_${{ github.event.inputs.device_model }}=y" >> .config
+        
+        # LuCI 配置
+        if [ "${{ github.event.inputs.enable_luci }}" = "true" ]; then
+          echo "启用 LuCI 配置..."
+          echo "CONFIG_PACKAGE_luci=y" >> .config
+          echo "CONFIG_PACKAGE_luci-base=y" >> .config
+          echo "CONFIG_PACKAGE_luci-compat=y" >> .config
+          echo "CONFIG_PACKAGE_luci-lib-base=y" >> .config
+          echo "CONFIG_PACKAGE_luci-lib-ip=y" >> .config
+          echo "CONFIG_PACKAGE_luci-lib-jsonc=y" >> .config
+          echo "CONFIG_PACKAGE_luci-lib-nixio=y" >> .config
+          
+          # 主题配置
+          if [ "${{ github.event.inputs.luci_theme }}" = "material" ]; then
+            echo "CONFIG_PACKAGE_luci-theme-material=y" >> .config
+          elif [ "${{ github.event.inputs.luci_theme }}" = "argon" ]; then
+            echo "CONFIG_PACKAGE_luci-theme-argon=y" >> .config
+          else
+            echo "CONFIG_PACKAGE_luci-theme-bootstrap=y" >> .config
+          fi
+          
+          # 安装 LuCI 应用
+          IFS=',' read -ra APPS <<< "${{ github.event.inputs.include_luci_apps }}"
+          for app in "${APPS[@]}"; do
+            app_trimmed=$(echo "$app" | xargs)
+            if [ -n "$app_trimmed" ]; then
+              echo "CONFIG_PACKAGE_${app_trimmed}=y" >> .config
+            fi
+          done
+        fi
+        
+        # 其他常用配置
+        echo "CONFIG_PACKAGE_wpad-basic-wolfssl=y" >> .config
+        echo "CONFIG_PACKAGE_iperf3=y" >> .config
+        echo "CONFIG_PACKAGE_tcpdump=y" >> .config
+        
         make defconfig
+
+    - name: Customize LuCI Configuration
+      if: ${{ github.event.inputs.enable_luci }}
+      run: |
+        echo "自定义 LuCI 配置..."
+        
+        # 设置默认主题
+        if [ -d "package/feeds/luci/luci" ]; then
+          mkdir -p files/etc/uci-defaults
+          cat > files/etc/uci-defaults/99_luci-theme << EOF
+#!/bin/sh
+uci -q batch << EOI
+set luci.main.mediaurlbase='/luci-static/${{ github.event.inputs.luci_theme }}'
+set luci.themes.${{ github.event.inputs.luci_theme }}=${{ github.event.inputs.luci_theme }}
+commit luci
+EOI
+exit 0
+EOF
+          chmod +x files/etc/uci-defaults/99_luci-theme
+        fi
+        
+        # 创建自定义 LuCI 配置
+        mkdir -p files/etc/config
+        cat > files/etc/config/luci << EOF
+config core 'main'
+        option lang 'auto'
+        option mediaurlbase '/luci-static/${{ github.event.inputs.luci_theme }}'
+        option resourcebase '/luci-static/resources'
+
+config internal 'themes'
+        option ${{ github.event.inputs.luci_theme }} '${{ github.event.inputs.luci_theme }}'
+
+config internal 'sauth'
+        option sessionpath '/tmp/luci-sessions'
+        option maxstay '3600'
+EOF
 
     - name: Build Firmware
       id: build
@@ -93,6 +230,7 @@ jobs:
         
         if [ ${PIPESTATUS[0]} -eq 0 ]; then
           echo "build_status=success" >> $GITHUB_OUTPUT
+          echo "luci_enabled=${{ github.event.inputs.enable_luci }}" >> $GITHUB_OUTPUT
         else
           echo "build_status=failure" >> $GITHUB_OUTPUT
           echo "=== 错误摘要 ==="
@@ -110,6 +248,11 @@ jobs:
         echo "分支: ${{ github.event.inputs.source_branch }}" >> error-logs/summary.txt
         echo "架构: ${{ github.event.inputs.target_arch }}" >> error-logs/summary.txt
         echo "型号: ${{ github.event.inputs.device_model }}" >> error-logs/summary.txt
+        echo "LuCI 启用: ${{ github.event.inputs.enable_luci }}" >> error-logs/summary.txt
+        if [ "${{ github.event.inputs.enable_luci }}" = "true" ]; then
+          echo "LuCI 主题: ${{ github.event.inputs.luci_theme }}" >> error-logs/summary.txt
+          echo "LuCI 应用数量: ${{ steps.configure_luci.outputs.luci_apps_count }}" >> error-logs/summary.txt
+        fi
         echo "" >> error-logs/summary.txt
         
         if [ -f "build-logs/build.log" ]; then
@@ -122,13 +265,7 @@ jobs:
       with:
         name: error-logs-${{ github.run_id }}
         path: error-logs/
-        retention-days: 30
-
-    - name: Generate Release Tag
-      if: ${{ github.event.inputs.create_release && steps.build.outputs.build_status == 'success' }}
-      id: tag
-      run: |
-        echo "tag_name=openwrt-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}-${{ github.run_id }}" >> $GITHUB_OUTPUT
+        retention-days: 7
 
     - name: Upload Artifacts
       if: steps.build.outputs.build_status == 'success'
@@ -140,9 +277,9 @@ jobs:
 
     - name: Create Release
       if: ${{ github.event.inputs.create_release && steps.build.outputs.build_status == 'success' }}
-      uses: softprops/action-gh-release@v1
+      uses: ncipollo/release-action@v1
       with:
-        tag_name: ${{ steps.tag.outputs.tag_name }}
+        tag: openwrt-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}-${{ github.run_id }}
         name: OpenWrt ${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}
         body: |
           OpenWrt 自动构建
@@ -151,9 +288,14 @@ jobs:
           - 源码分支: ${{ github.event.inputs.source_branch }}
           - 设备架构: ${{ github.event.inputs.target_arch }}
           - 设备型号: ${{ github.event.inputs.device_model }}
-          - 构建时间: ${{ fromJSON(format('"{0}"', github.workflow_run.created_at)) }}
+          - LuCI 界面: ${{ github.event.inputs.enable_luci && '启用' || '禁用' }}
+          ${{ github.event.inputs.enable_luci && format('- LuCI 主题: {0}', github.event.inputs.luci_theme) || '' }}
+          ${{ github.event.inputs.enable_luci && format('- LuCI 应用: {0}', github.event.inputs.include_luci_apps) || '' }}
           - 自定义 Feeds: ${{ github.event.inputs.custom_feeds != '' && '是' || '否' }}
-        files: bin/targets/**/*
+        artifacts: "bin/targets/**/*"
+        draft: false
+        prerelease: false
+        token: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Build Failed
       if: steps.build.outputs.build_status == 'failure'
