@@ -90,12 +90,14 @@ jobs:
       if: ${{ github.event.inputs.custom_feeds != '' }}
       run: |
         if [ -n "${{ github.event.inputs.custom_feeds }}" ]; then
-          echo "${{ github.event.inputs.custom_feeds }}" | while IFS= read -r line; do
+          echo "${{ github.event.inputs.custom_feeds }}" > /tmp/custom_feeds.txt
+          while IFS= read -r line; do
             line_trimmed=$(echo "$line" | xargs)
             if [ -n "$line_trimmed" ] && [[ $line_trimmed == *">"* ]]; then
               echo "$line_trimmed" >> feeds.conf.default
             fi
-          done
+          done < /tmp/custom_feeds.txt
+          rm -f /tmp/custom_feeds.txt
           cat feeds.conf.default
         fi
 
@@ -137,12 +139,12 @@ jobs:
 
     - name: Configure Build
       run: |
-        TARGET_ARCH_UPPER=$(echo "${{ github.event.inputs.target_arch }}" | tr '[:lower:]' '[:upper:]')
-        DEVICE_MODEL_UPPER=$(echo "${{ github.event.inputs.device_model }}" | tr '[:lower:]' '[:upper:]')
+        TARGET_ARCH="${{ github.event.inputs.target_arch }}"
+        DEVICE_MODEL="${{ github.event.inputs.device_model }}"
         
         cat > .config << EOF
-CONFIG_TARGET_${TARGET_ARCH_UPPER}=y
-CONFIG_TARGET_${TARGET_ARCH_UPPER}_${DEVICE_MODEL_UPPER}=y
+CONFIG_TARGET_${TARGET_ARCH}=y
+CONFIG_TARGET_${TARGET_ARCH}_${DEVICE_MODEL}=y
 CONFIG_PACKAGE_luci=y
 CONFIG_PACKAGE_luci-base=y
 CONFIG_PACKAGE_luci-compat=y
@@ -226,12 +228,12 @@ EOF
           exit 1
         fi
         
-        FIRMWARE_FILES=$(find bin/targets -type f -size +1M | grep -E '\.(bin|img|tar|gz|trx|elf|ubi|ubifs|squashfs|ext4)$' || true)
-        FIRMWARE_COUNT=$(echo "$FIRMWARE_FILES" | wc -l 2>/dev/null || echo 0)
+        FIRMWARE_FILES=$(find bin/targets -type f \( -name "*.bin" -o -name "*.img" -o -name "*.tar" -o -name "*.gz" -o -name "*.trx" -o -name "*.elf" -o -name "*.ubi" -o -name "*.ubifs" -o -name "*.squashfs" -o -name "*.ext4" \) ! -name "*.sha256sums" ! -name "*.log" -size +1M 2>/dev/null || true)
+        FIRMWARE_COUNT=$(echo "$FIRMWARE_FILES" | grep -c . 2>/dev/null || echo 0)
         
         if [ $FIRMWARE_COUNT -eq 0 ]; then
           echo "❌ 未找到任何固件文件"
-          find bin/targets -type f | head -20
+          find bin/targets -type f 2>/dev/null | head -20
           exit 1
         fi
 
@@ -265,7 +267,7 @@ EOF
       if: ${{ github.event.inputs.create_release && steps.build.outputs.build_status == 'success' }}
       uses: ncipollo/release-action@v2
       with:
-        tag: openwrt-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}-${{ github.run_number }}
+        tag: openwrt-${{ github.event.inputs.source_branch }}-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}-${{ github.run_number }}
         name: OpenWrt ${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}
         body: |
           构建信息:
@@ -274,7 +276,7 @@ EOF
           - 设备型号: ${{ github.event.inputs.device_model }}
           - LuCI应用: ${{ github.event.inputs.include_luci_apps }}
           - 构建耗时: ${{ steps.build.outputs.build_duration }} 秒
-        artifacts: "bin/targets/**/*"
+        artifacts: "bin/targets/**/*.bin,bin/targets/**/*.img,bin/targets/**/*.tar,bin/targets/**/*.gz,bin/targets/**/*.trx,bin/targets/**/*.elf,bin/targets/**/*.ubi,bin/targets/**/*.ubifs,bin/targets/**/*.squashfs,bin/targets/**/*.ext4"
         draft: false
         prerelease: false
         allowUpdates: true
