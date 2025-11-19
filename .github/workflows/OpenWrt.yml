@@ -64,7 +64,6 @@ on:
         type: boolean
 
 env:
-  # 正确定义环境变量，避免后续步骤引用问题
   TARGET_ARCH: ${{ github.event.inputs.target_arch }}
   DEVICE_MODEL: ${{ github.event.inputs.device_model }}
   CCACHE_DIR: ${{ github.workspace }}/.ccache
@@ -397,7 +396,7 @@ EOF
           - **Build Duration**: ${{ steps.build_firmware.outputs.build_duration }} seconds
           - **Build Profile**: ${{ github.event.inputs.build_profile }}
           - **Chinese Support**: ${{ github.event.inputs.include_chinese }}
-          - **Build Date**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          - **Build Date**: '$(date -u +"%Y-%m-%d %H:%M:%S UTC")'
           
           ## Included Packages
           - **LuCI Applications**: ${{ github.event.inputs.include_luci_apps }}
@@ -423,8 +422,10 @@ EOF
         echo "Exit code: ${{ steps.build_firmware.outputs.build_exit_code }}"
         
         if [ -f "logs/build.log" ]; then
-          echo "Last 50 lines of build log:"
-          tail -50 logs/build.log
+          echo "Last 100 lines of build log:"
+          tail -100 logs/build.log
+          echo "Key error analysis:"
+          grep -A 5 -B 10 "error:" logs/build.log || echo "No explicit error markers found"
         elif [ -d "logs" ]; then
           echo "Available log files:"
           find logs -type f -name "*.log" | head -10
