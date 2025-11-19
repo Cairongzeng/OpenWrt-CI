@@ -114,8 +114,6 @@ jobs:
           file \
           time \
           ccache \
-          python3-dev \
-          python3-wheel \
           subversion \
           libxml-parser-perl \
           libjson-perl \
@@ -137,39 +135,40 @@ jobs:
           dl
           build_dir
           staging_dir
-        key: openwrt-build-${{ runner.os }}-${{ github.event.inputs.source_branch }}-${{ env.TARGET_ARCH }}-${{ env.DEVICE_MODEL }}-${{ steps.repo_info.outputs.sha }}
+        key: openwrt-build-${{ runner.os }}-${{ github.event.inputs.source_branch }}-${{ env.TARGET_ARCH }}-${{ env.DEVICE_MODEL }}
         restore-keys: |
-          openwrt-build-${{ runner.os }}-${{ github.event.inputs.source_branch }}-${{ env.TARGET_ARCH }}-${{ env.DEVICE_MODEL }}-
-          openwrt-build-${{ runner.os }}-${{ github.event.inputs.source_branch }}-${{ env.TARGET_ARCH }}-
-          openwrt-build-${{ runner.os }}-${{ github.event.inputs.source_branch }}-
-          openwrt-build-${{ runner.os }}-
+          openwrt-build-${{ runner.os }}-${{ github.event.inputs.source_branch }}-${{ env.TARGET_ARCH }}-${{ env.DEVICE_MODEL }}
+          openwrt-build-${{ runner.os }}-${{ github.event.inputs.source_branch }}-${{ env.TARGET_ARCH }}
+          openwrt-build-${{ runner.os }}-${{ github.event.inputs.source_branch }}
+          openwrt-build-${{ runner.os }}
 
-    - name: Setup Custom Package Feeds
-      if: github.event.inputs.custom_feeds != ''
+    - name: Setup and Update Package Feeds
       run: |
-        echo "🔧 Setting up custom feeds..."
-        echo "${{ github.event.inputs.custom_feeds }}" | while IFS= read -r line; do
-          line_cleaned=$(echo "$line" | tr -d '\r' | sed 's/[^a-zA-Z0-9>._:-]//g')
-          if [ -n "$line_cleaned" ] && [[ $line_cleaned == *">"* ]]; then
-            feed_name=$(echo "$line_cleaned" | cut -d'>' -f1)
-            feed_url=$(echo "$line_cleaned" | cut -d'>' -f2-)
-            
-            # 严格验证HTTPS协议和证书有效性
-            if [[ $feed_url =~ ^https:// ]] && [ -n "$feed_name" ]; then
-              if curl -sI "$feed_url" | grep -q "HTTP/"; then
-                echo "Adding feed: $feed_name > $feed_url"
-                echo "$line_cleaned" >> feeds.conf.default
+        # 设置自定义feeds
+        if [ "${{ github.event.inputs.custom_feeds }}" ]; then
+          echo "🔧 Setting up custom feeds..."
+          echo "${{ github.event.inputs.custom_feeds }}" | while IFS= read -r line; do
+            line_cleaned=$(echo "$line" | tr -d '\r' | sed 's/[^a-zA-Z0-9>._:-]//g')
+            if [ "$line_cleaned" ] && [[ $line_cleaned == *">"* ]]; then
+              feed_name=$(echo "$line_cleaned" | cut -d'>' -f1)
+              feed_url=$(echo "$line_cleaned" | cut -d'>' -f2-)
+              
+              # 严格验证HTTPS协议和证书有效性
+              if [[ $feed_url =~ ^https:// ]] && [ "$feed_name" ]; then
+                if curl -sI "$feed_url" | grep -q "HTTP/"; then
+                  echo "Adding feed: $feed_name > $feed_url"
+                  echo "$line_cleaned" >> feeds.conf.default
+                else
+                  echo "⚠️ Skipping feed with invalid HTTPS certificate: $feed_url"
+                fi
               else
-                echo "⚠️ Skipping feed with invalid HTTPS certificate: $feed_url"
+                echo "⚠️ Skipping non-HTTPS feed: $feed_url"
               fi
-            else
-              echo "⚠️ Skipping non-HTTPS feed: $feed_url"
             fi
-          fi
-        done
-
-    - name: Update Package Feeds
-      run: |
+          done
+        fi
+        
+        # 更新package feeds
         echo "🔄 Updating package feeds..."
         ./scripts/feeds update -a
         ./scripts/feeds install -a
@@ -193,12 +192,12 @@ jobs:
           ./scripts/feeds install "$pkg" || echo "⚠️ Optional package $pkg installation failed"
         done
 
-        if [ -n "${{ github.event.inputs.include_luci_apps }}" ]; then
+        if [ "${{ github.event.inputs.include_luci_apps }}" ]; then
           echo "📦 Installing LuCI applications..."
           IFS=',' read -ra APPS <<< "${{ github.event.inputs.include_luci_apps }}"
           for app in "${APPS[@]}"; do
             app_cleaned=$(echo "$app" | xargs | sed 's/[^a-zA-Z0-9_-]//g')
-            if [ -n "$app_cleaned" ]; then
+            if [ "$app_cleaned" ]; then
               ./scripts/feeds install "$app_cleaned" || echo "⚠️ LuCI app $app_cleaned installation failed"
             fi
           done
@@ -209,12 +208,12 @@ jobs:
           ./scripts/feeds install luci-i18n-base-zh-cn || echo "⚠️ Chinese language pack installation failed"
         fi
         
-        if [ -n "${{ github.event.inputs.include_packages }}" ]; then
+        if [ "${{ github.event.inputs.include_packages }}" ]; then
           echo "📦 Installing custom packages..."
           IFS=',' read -ra PKGS <<< "${{ github.event.inputs.include_packages }}"
           for pkg in "${PKGS[@]}"; do
             pkg_cleaned=$(echo "$pkg" | xargs | sed 's/[^a-zA-Z0-9_-]//g')
-            if [ -n "$pkg_cleaned" ]; then
+            if [ "$pkg_cleaned" ]; then
               ./scripts/feeds install "$pkg_cleaned" || echo "⚠️ Custom package $pkg_cleaned installation failed"
             fi
           done
@@ -226,7 +225,7 @@ jobs:
           sudo apt-get install -y gettext
         fi
         
-        # 直接生成配置文件，避免使用模板和sed替换
+        # 直接生成配置文件
         cat > .config << EOF
 # Target configuration
 CONFIG_TARGET_${{ env.TARGET_ARCH | tr '[:lower:]' '[:upper:]' | tr '.-' '_' }}=y
@@ -255,31 +254,31 @@ EOF
           echo "CONFIG_PACKAGE_luci-i18n-base-zh-cn=y" >> .config
         fi
 
-        if [ -n "${{ github.event.inputs.include_luci_apps }}" ]; then
+        if [ "${{ github.event.inputs.include_luci_apps }}" ]; then
           IFS=',' read -ra APPS <<< "${{ github.event.inputs.include_luci_apps }}"
           for app in "${APPS[@]}"; do
             app_cleaned=$(echo "$app" | xargs | sed 's/[^a-zA-Z0-9_-]//g')
-            if [ -n "$app_cleaned" ]; then
+            if [ "$app_cleaned" ]; then
               echo "CONFIG_PACKAGE_${app_cleaned}=y" >> .config
             fi
           done
         fi
 
-        if [ -n "${{ github.event.inputs.include_packages }}" ]; then
+        if [ "${{ github.event.inputs.include_packages }}" ]; then
           IFS=',' read -ra PKGS <<< "${{ github.event.inputs.include_packages }}"
           for pkg in "${PKGS[@]}"; do
             pkg_cleaned=$(echo "$pkg" | xargs | sed 's/[^a-zA-Z0-9_-]//g')
-            if [ -n "$pkg_cleaned" ]; then
+            if [ "$pkg_cleaned" ]; then
               echo "CONFIG_PACKAGE_${pkg_cleaned}=y" >> .config
             fi
           done
         fi
 
-        if [ -n "${{ github.event.inputs.kernel_modules }}" ]; then
+        if [ "${{ github.event.inputs.kernel_modules }}" ]; then
           IFS=',' read -ra MODULES <<< "${{ github.event.inputs.kernel_modules }}"
           for module in "${MODULES[@]}"; do
             module_cleaned=$(echo "$module" | xargs | sed 's/[^a-zA-Z0-9_-]//g')
-            if [ -n "$module_cleaned" ]; then
+            if [ "$module_cleaned" ]; then
               echo "CONFIG_PACKAGE_kmod-${module_cleaned}=y" >> .config
             fi
           done
