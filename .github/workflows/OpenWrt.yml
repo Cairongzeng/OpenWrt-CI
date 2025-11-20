@@ -49,27 +49,22 @@ jobs:
     timeout-minutes: 180
     
     steps:
-    - name: 检出OpenWrt源代码
+    - name: 检出 OpenWrt 源代码
       uses: actions/checkout@v4
       with:
         repository: openwrt/openwrt
         ref: ${{ github.event.inputs.source_branch }}
         submodules: recursive
-        fetch-depth: 0
 
     - name: 验证源代码结构
       run: |
-        echo "## 验证 OpenWrt 源代码结构"
-        echo "工作目录: $(pwd)"
+        echo "验证 OpenWrt 源代码结构"
         
-        # 检查关键文件
-        REQUIRED_FILES=("scripts/feeds" "feeds.conf.default" "rules.mk" "Makefile")
+        REQUIRED_FILES=("scripts/feeds" "feeds.conf.default" "Makefile")
         for file in "${REQUIRED_FILES[@]}"; do
           if [ -f "$file" ]; then
             echo "✅ $file 存在"
-            if [[ "$file" == *"feeds" ]]; then
-              chmod +x "$file"
-            fi
+            [ "$file" = "scripts/feeds" ] && chmod +x "$file"
           else
             echo "❌ 错误: $file 不存在"
             exit 1
@@ -78,13 +73,22 @@ jobs:
 
     - name: 安装构建依赖
       run: |
-        sudo apt-get update -q
-        # OpenWrt 官方推荐的构建依赖
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        sudo apt-get update
+        # OpenWrt 官方构建依赖
+        sudo apt-get install -y \
           build-essential clang flex bison g++ gawk gcc-multilib \
           g++-multilib gettext git libncurses5-dev libssl-dev \
           python3-setuptools rsync unzip zlib1g-dev file wget \
-          make ccache
+          make ccache ecj fastjar java-propose-classpath \
+          libxml-parser-perl libelf-dev autoconf automake \
+          libtool autopoint device-tree-compiler curl \
+          python3 python3-pip python3-dev pkg-config bc kmod \
+          ack antlr3 asciidoc bzip2 cmake cpio help2man intltool \
+          libc6-dev-i386 libfuse-dev libglib2.0-dev libgmp3-dev \
+          libltdl-dev libmpc-dev libmpfr-dev libncursesw5-dev \
+          libreadline-dev libpython3-dev ninja-build patch \
+          python3-pyelftools qemu-utils scons squashfs-tools \
+          subversion swig texinfo uglifyjs upx-ucl xmlto xxd
 
     - name: 配置构建缓存
       uses: actions/cache@v4
@@ -92,54 +96,46 @@ jobs:
         path: |
           ~/.ccache
           dl
-          build_dir
-          staging_dir
-        key: ${{ runner.os }}-openwrt-${{ github.event.inputs.source_branch }}-${{ hashFiles('feeds.conf.default') }}
+        key: openwrt-${{ github.event.inputs.source_branch }}-${{ hashFiles('feeds.conf.default') }}
         restore-keys: |
-          ${{ runner.os }}-openwrt-${{ github.event.inputs.source_branch }}-
-          ${{ runner.os }}-openwrt-
+          openwrt-${{ github.event.inputs.source_branch }}-
+          openwrt-
 
-    - name: 设置ccache缓存
+    - name: 设置 ccache
       run: |
-        ccache -M 10G
+        ccache -M 5G
         ccache -s
 
-    - name: 初始化feeds
+    - name: 初始化 feeds
       run: |
-        chmod +x scripts/feeds
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
     - name: 生成基础配置
       run: |
-        set -e
-        
         # 创建基础配置
-        cat << EOF > .config
+        cat > .config << EOF
 CONFIG_TARGET_${{ github.event.inputs.target_arch }}=y
 CONFIG_TARGET_${{ github.event.inputs.target_arch }}_${{ github.event.inputs.device_model }}=y
 CONFIG_CCACHE=y
 CONFIG_BUILD_LOG=y
 EOF
-        
         make defconfig
 
     - name: 自定义软件包配置
       run: |
-        set -e
-        
-        # 添加LuCI应用
+        # 添加 LuCI 应用
         if [ -n "${{ github.event.inputs.include_luci_apps }}" ]; then
-          IFS=',' read -ra LUCI_APPS <<< "${{ github.event.inputs.include_luci_apps }}"
-          for app in "${LUCI_APPS[@]}"; do
+          IFS=',' read -ra APPS <<< "${{ github.event.inputs.include_luci_apps }}"
+          for app in "${APPS[@]}"; do
             echo "CONFIG_PACKAGE_${app}=y" >> .config
           done
         fi
         
         # 添加功能包
         if [ -n "${{ github.event.inputs.include_packages }}" ]; then
-          IFS=',' read -ra PACKAGES <<< "${{ github.event.inputs.include_packages }}"
-          for pkg in "${PACKAGES[@]}"; do
+          IFS=',' read -ra PKGS <<< "${{ github.event.inputs.include_packages }}"
+          for pkg in "${PKGS[@]}"; do
             echo "CONFIG_PACKAGE_${pkg}=y" >> .config
           done
         fi
@@ -148,32 +144,24 @@ EOF
 
     - name: 预下载软件包
       run: |
-        set -e
         make download -j$(nproc) || make download -j1
 
-    - name: 构建OpenWrt固件
+    - name: 构建 OpenWrt 固件
       run: |
-        set -e
         mkdir -p $BUILD_LOG_DIR
         
-        BUILD_OPTIONS=""
         if [ "${{ github.event.inputs.verbose_build }}" = "true" ]; then
-          BUILD_OPTIONS="V=s"
+          make V=s -j$(nproc) 2>&1 | tee $BUILD_LOG_DIR/build.log
+        else
+          make -j$(nproc) 2>&1 | tee $BUILD_LOG_DIR/build.log
         fi
-        
-        make -j$(nproc) $BUILD_OPTIONS 2>&1 | tee $BUILD_LOG_DIR/build.log || {
-          echo "构建失败，最后100行日志:"
-          tail -100 $BUILD_LOG_DIR/build.log
-          exit 1
-        }
 
     - name: 上传构建产物
       if: success()
       uses: actions/upload-artifact@v4
       with:
-        name: openwrt-binaries
-        path: |
-          bin/targets/**
+        name: openwrt-firmware
+        path: bin/targets/
         retention-days: 7
 
     - name: 上传构建日志
@@ -181,6 +169,5 @@ EOF
       uses: actions/upload-artifact@v4
       with:
         name: build-logs
-        path: |
-          $BUILD_LOG_DIR/
+        path: $BUILD_LOG_DIR/
         retention-days: 7
