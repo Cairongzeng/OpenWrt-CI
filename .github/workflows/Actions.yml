@@ -190,7 +190,7 @@ jobs:
 
     - name: 创建 GitHub Release
       if: github.event.inputs.create_release == 'true' && success()
-      uses: ncipollo/release-action@v2
+      uses: ncipollo/release-action@v1
       with:
         tag: ${{ env.RELEASE_TAG }}
         name: OpenWrt Build ${{ env.BUILD_DATE }}
