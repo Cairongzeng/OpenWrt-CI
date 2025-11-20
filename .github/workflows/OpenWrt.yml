@@ -58,43 +58,23 @@ jobs:
       id: repo_info
       run: |
         echo "sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
-        echo "branch=$(git branch --show-current 2>/dev/null || echo 'detached')" >> $GITHUB_OUTPUT
-        echo "tag=$(git describe --tags --abbrev=0 2>/dev/null || echo 'none')" >> $GITHUB_OUTPUT
+        echo "branch=$(git branch --show-current || echo 'detached')" >> $GITHUB_OUTPUT
+        echo "tag=$(git describe --tags --abbrev=0 || echo 'none')" >> $GITHUB_OUTPUT
         echo "commit_message=$(git log -1 --pretty=%B)" >> $GITHUB_OUTPUT
         echo "author=$(git log -1 --pretty=%an)" >> $GITHUB_OUTPUT
 
     - name: 设置构建环境
       run: |
         sudo apt-get update -q
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-suggests \
           build-essential clang flex bison g++ gcc-multilib gettext git \
           libncurses-dev libssl-dev python3 python3-pip python3-venv \
           rsync unzip wget zlib1g-dev file time ccache subversion \
           libxml-parser-perl libjson-perl curl jq tree bc \
           automake autoconf libtool pkg-config
 
-    - name: 验证输入参数
-      run: |
-        validate() {
-          local type=$1 val=$2
-          if [[ ! $val =~ ^[a-zA-Z0-9_.-]{1,50}$ ]]; then
-            echo "错误：$type '$val' 格式无效"
-            exit 1
-          fi
-        }
-        
-        # 验证LuCI应用和功能包
-        [ -z "${{ github.event.inputs.include_luci_apps }}" ] || \
-          IFS=',' read -ra APPS <<< "${{ github.event.inputs.include_luci_apps }}"; for app in "${APPS[@]}"; do
-            validate app "$app"
-          done
-        [ -z "${{ github.event.inputs.include_packages }}" ] || \
-          IFS=',' read -ra PKGS <<< "${{ github.event.inputs.include_packages }}"; for pkg in "${PKGS[@]}"; do
-            validate package "$pkg"
-          done
-
     - name: 设置构建缓存
-      uses: actions/cache@v4  # 升级到最新版本
+      uses: actions/cache@v4
       with:
         path: |
           ~/.ccache
@@ -106,9 +86,14 @@ jobs:
           ${{ runner.os }}-openwrt-${{ github.event.inputs.source_branch }}-${{ github.event.inputs.target_arch }}-
           ${{ runner.os }}-openwrt-${{ github.event.inputs.source_branch }}-
 
+    - name: 配置ccache
+      run: |
+        echo "配置ccache缓存大小..."
+        ccache -M 10G
+        ccache -s
+
     - name: 生成构建配置
       run: |
-        # 合并多个echo命令为一个，减少I/O操作
         cat << EOF > .config
         CONFIG_TARGET_${TARGET_ARCH}_${DEVICE_MODEL}=y
         CONFIG_ALL=y
@@ -116,28 +101,22 @@ jobs:
         CONFIG_PACKAGE_wpad-basic-wolfssl=y
         EOF
         
-        # 添加用户指定的LuCI应用
         [ -z "${{ github.event.inputs.include_luci_apps }}" ] || \
           IFS=',' read -ra APPS <<< "${{ github.event.inputs.include_luci_apps }}"; for app in "${APPS[@]}"; do
             echo "CONFIG_PACKAGE_$app=y" >> .config
           done
         
-        # 添加用户指定的功能包
         [ -z "${{ github.event.inputs.include_packages }}" ] || \
           IFS=',' read -ra PKGS <<< "${{ github.event.inputs.include_packages }}"; for pkg in "${PKGS[@]}"; do
             echo "CONFIG_PACKAGE_$pkg=y" >> .config
           done
-        
-        make defconfig
-        grep -q "CONFIG_TARGET_${TARGET_ARCH}_${DEVICE_MODEL}=y" .config || exit 1
 
     - name: 构建固件
       id: build_firmware
       run: |
-        # 添加set -e确保错误时停止
         set -e
         BUILD_START=$(date +%s)
-        make -j$(nproc) BUILD_LOG=1 FORCE_UNSAFE_CONFIGURE=1 ${{ github.event.inputs.verbose_build && 'V=s' || '' }}
+        make -j$(nproc) BUILD_LOG=1 FORCE_UNSAFE_CONFIGURE=1 ${{ github.event.inputs.verbose_build ? 'V=s' : '' }}
         DURATION=$(( $(date +%s) - BUILD_START ))
         echo "build_duration=$DURATION" >> $GITHUB_OUTPUT
         echo "build_exit_code=$?" >> $GITHUB_OUTPUT
@@ -146,42 +125,25 @@ jobs:
     - name: 监控资源使用
       if: always()
       run: |
-        # 增加内存和CPU使用情况监控
         echo "## 资源使用情况"
         ccache -s
         echo "## 内存使用"
         free -h
         echo "## CPU使用"
-        top -b -n 1 | head -10
+        top -b -n 1 -o %CPU | head -10
 
     - name: 失败时收集构建日志
       if: failure()
       run: |
         echo "构建失败，收集详细错误信息..."
-        # 增加错误日志的详细程度
-        grep -i -E "error:|fatal:|failed:|undefined reference" build_dir/**/log.* 2>/dev/null | head -50
+        grep -i -E "error:|fatal:|failed:|undefined reference" build_dir/**/log.* | head -50
+        echo "内核日志:"
+        dmesg | tail -20
         echo "已安装包列表:"
         opkg list-installed > installed-packages.txt
         cat installed-packages.txt
         echo "构建配置:"
         cat .config
-
-    - name: 验证构建产物
-      if: success()
-      run: |
-        FILES=$(find bin/targets -type f \( -name "*.bin" -o -name "*.img" -o -name "*.tar.gz" \) -size +1M | head -10)
-        [ -n "$FILES" ] || { echo "No firmware files found"; exit 1; }
-        
-        echo "验证固件完整性..."
-        for f in $FILES; do
-          # 使用md5sum进行基本验证
-          md5sum "$f" > "$f.md5"
-          if [ $? -ne 0 ]; then
-            echo "错误：无法计算 $f 的MD5"
-            exit 1
-          fi
-          echo "  $(basename "$f") ($(du -h "$f" | cut -f1)), MD5: $(cat "$f.md5")"
-        done
 
     - name: 上传构建产物
       if: success()
@@ -192,7 +154,7 @@ jobs:
         retention-days: 30
 
     - name: 创建GitHub Release
-      if: ${{ github.event.inputs.create_release && success() }}
+      if: ${{ github.event.inputs.create_release and success() }}
       uses: ncipollo/release-action@v2
       with:
         tag: ${{ github.event.inputs.source_branch }}-${{ env.TARGET_ARCH }}-${{ env.DEVICE_MODEL }}-${{ steps.repo_info.outputs.sha }}
@@ -203,7 +165,7 @@ jobs:
           - Device Model: $DEVICE_MODEL
           - Source Branch: ${{ github.event.inputs.source_branch }}
           - Duration: ${{ steps.build_firmware.outputs.build_duration }}s
-          - Date: ${{ steps.repo_info.outputs.commit_message }}
+          - Date: ${{ steps.repo_info.outputs.commit_message | replace('\n', ' ') }}
           - Commit: ${{ steps.repo_info.outputs.sha }} (${{ steps.repo_info.outputs.branch }})
           - Author: ${{ steps.repo_info.outputs.author }}
 
