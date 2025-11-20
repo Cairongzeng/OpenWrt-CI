@@ -1,40 +1,40 @@
-name: OpenWrt Build
+name: OpenWrt 构建
 
 on:
   workflow_dispatch:
     inputs:
       source_branch:
-        description: 'Source branch (e.g., main, openwrt-24.10)'
+        description: '源码分支（如 main, openwrt-24.10）'
         required: true
         default: 'openwrt-24.10'
         type: string
       target_arch:
-        description: 'Target architecture (e.g., airoha, x86_64)'
+        description: '设备架构（如 airoha, x86_64）'
         required: true
         default: 'airoha'
         type: string
       device_model:
-        description: 'Device model (e.g., an7581)'
+        description: '设备型号（如 an7581）'
         required: true
         default: 'an7581'
         type: string
       include_luci_apps:
-        description: 'LuCI apps (comma separated, e.g., luci-app-adblock)'
+        description: 'LuCI 应用（逗号分隔，如 luci-app-adblock）'
         required: false
         default: 'luci-mod-admin-full,luci-theme-bootstrap,luci-app-statistics,luci-app-upnp,luci-app-firewall,luci-app-wireguard,luci-app-wifi-schedule'
         type: string
       include_packages:
-        description: 'Additional packages (comma separated, non-LuCI)'
+        description: '功能包列表（非 LuCI，逗号分隔）'
         required: false
         default: 'tailscale,iperf3,tcpdump,curl,wget,htop,nano'
         type: string
       create_release:
-        description: 'Create GitHub Release'
+        description: '发布到 GitHub Release'
         required: false
         default: false
         type: boolean
       verbose_build:
-        description: 'Enable verbose build output (V=s)'
+        description: '启用详细构建输出（V=s）'
         required: false
         default: false
         type: boolean
@@ -49,30 +49,31 @@ jobs:
     timeout-minutes: 180
     
     steps:
-    - name: Checkout OpenWrt source
+    - name: 检出 OpenWrt 源代码
       uses: actions/checkout@v4
       with:
         repository: openwrt/openwrt
         ref: ${{ github.event.inputs.source_branch }}
         submodules: true
 
-    - name: Validate source structure
+    - name: 验证源代码结构
       run: |
-        echo "Validating OpenWrt source structure"
+        echo "正在验证 OpenWrt 源代码结构"
         
         REQUIRED_FILES=("scripts/feeds" "feeds.conf.default" "Makefile")
         for file in "${REQUIRED_FILES[@]}"; do
           if [ -f "$file" ]; then
-            echo "✅ $file exists"
+            echo "✅ $file 存在"
             [ "$file" = "scripts/feeds" ] && chmod +x "$file"
           else
-            echo "❌ Error: $file missing"
+            echo "❌ 错误: $file 不存在"
             exit 1
           fi
         done
 
-    - name: Install build dependencies
+    - name: 安装构建依赖
       run: |
+        set -e
         sudo apt-get update
         sudo apt-get install -y \
           build-essential clang flex bison g++ gawk gcc-multilib \
@@ -89,7 +90,7 @@ jobs:
           python3-pyelftools qemu-utils scons squashfs-tools \
           subversion swig texinfo uglifyjs upx-ucl xmlto xxd
 
-    - name: Configure build cache
+    - name: 配置构建缓存
       uses: actions/cache@v4
       with:
         path: |
@@ -100,19 +101,21 @@ jobs:
           ${{ runner.os }}-openwrt-${{ github.event.inputs.source_branch }}-
           ${{ runner.os }}-openwrt-
 
-    - name: Setup ccache
+    - name: 设置 ccache
       run: |
         ccache -M 5G
         ccache -s
 
-    - name: Initialize feeds
+    - name: 初始化 feeds
       run: |
+        set -e
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
-    - name: Generate base config
+    - name: 生成基础配置
       run: |
-        # Create base configuration
+        set -e
+        # 创建基础配置
         {
           echo "CONFIG_TARGET_${{ github.event.inputs.target_arch }}=y"
           echo "CONFIG_TARGET_${{ github.event.inputs.target_arch }}_${{ github.event.inputs.device_model }}=y"
@@ -121,9 +124,10 @@ jobs:
         } > .config
         make defconfig
 
-    - name: Custom package configuration
+    - name: 自定义软件包配置
       run: |
-        # Add LuCI apps
+        set -e
+        # 添加 LuCI 应用
         if [ -n "${{ github.event.inputs.include_luci_apps }}" ]; then
           IFS=',' read -ra APPS <<< "${{ github.event.inputs.include_luci_apps }}"
           for app in "${APPS[@]}"; do
@@ -131,7 +135,7 @@ jobs:
           done
         fi
         
-        # Add additional packages
+        # 添加功能包
         if [ -n "${{ github.event.inputs.include_packages }}" ]; then
           IFS=',' read -ra PKGS <<< "${{ github.event.inputs.include_packages }}"
           for pkg in "${PKGS[@]}"; do
@@ -141,28 +145,26 @@ jobs:
         
         make defconfig
 
-    - name: Pre-download packages
+    - name: 预下载软件包
       run: |
+        set -e
         make download -j$(nproc) || make download -j1
 
-    - name: Build OpenWrt firmware
+    - name: 构建 OpenWrt 固件
       run: |
+        set -e
         mkdir -p $BUILD_LOG_DIR
         
-        # Set build options based on input
+        # 根据输入设置构建选项
         if [ "${{ github.event.inputs.verbose_build }}" = "true" ]; then
-          BUILD_OPTIONS="V=s"
+          set -o pipefail
+          make V=s -j$(nproc) 2>&1 | tee $BUILD_LOG_DIR/build.log
         else
-          BUILD_OPTIONS=""
-        fi
-        
-        # Execute build with proper error handling
-        if ! make -j$(nproc) $BUILD_OPTIONS 2>&1 | tee $BUILD_LOG_DIR/build.log; then
-          echo "Build failed with exit code: $?"
-          exit 1
+          set -o pipefail
+          make -j$(nproc) 2>&1 | tee $BUILD_LOG_DIR/build.log
         fi
 
-    - name: Upload build artifacts
+    - name: 上传构建产物
       if: success()
       uses: actions/upload-artifact@v4
       with:
@@ -170,7 +172,7 @@ jobs:
         path: bin/targets/
         retention-days: 7
 
-    - name: Upload build logs
+    - name: 上传构建日志
       if: always()
       uses: actions/upload-artifact@v4
       with:
@@ -178,13 +180,13 @@ jobs:
         path: $BUILD_LOG_DIR/
         retention-days: 7
 
-    - name: Diagnostic info on failure
+    - name: 构建失败诊断信息
       if: failure()
       run: |
-        echo "Build failure diagnostic info:"
-        echo "Last 100 lines of build log:"
-        tail -100 $BUILD_LOG_DIR/build.log 2>/dev/null || echo "No build log found"
-        echo "Current directory contents:"
+        echo "构建失败诊断信息:"
+        echo "构建日志最后100行:"
+        tail -100 $BUILD_LOG_DIR/build.log 2>/dev/null || echo "未找到构建日志"
+        echo "当前目录内容:"
         ls -la
-        echo "Config file contents (first 100 lines):"
-        head -100 .config 2>/dev/null || echo "No config file found"
+        echo "配置文件内容（前100行）:"
+        head -100 .config 2>/dev/null || echo "未找到配置文件"
