@@ -96,10 +96,12 @@ jobs:
         path: |
           ~/.ccache
           dl
-        key: openwrt-${{ github.event.inputs.source_branch }}-${{ hashFiles('feeds.conf.default') }}
+          build_dir
+          staging_dir
+        key: ${{ runner.os }}-openwrt-${{ github.event.inputs.source_branch }}-${{ hashFiles('feeds.conf.default', '**.config', 'package/feeds/*/*/Makefile') }}
         restore-keys: |
-          openwrt-${{ github.event.inputs.source_branch }}-
-          openwrt-
+          ${{ runner.os }}-openwrt-${{ github.event.inputs.source_branch }}-
+          ${{ runner.os }}-openwrt-
 
     - name: 设置 ccache
       run: |
@@ -171,3 +173,14 @@ EOF
         name: build-logs
         path: $BUILD_LOG_DIR/
         retention-days: 7
+
+    - name: 诊断信息（构建失败时）
+      if: failure()
+      run: |
+        echo "构建失败诊断信息："
+        echo "最后100行构建日志："
+        tail -100 $BUILD_LOG_DIR/build.log || echo "无构建日志"
+        echo "当前目录内容："
+        ls -la
+        echo "config文件内容（前100行）："
+        head -100 .config || echo "无config文件"
