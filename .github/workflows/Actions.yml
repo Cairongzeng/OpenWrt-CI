@@ -1,4 +1,4 @@
-name: OpenWrt 源码编译
+name: OpenWrt Custom Firmware
 
 on:
   workflow_dispatch:
@@ -24,7 +24,7 @@ on:
         default: 'luci-mod-admin-full,luci-theme-bootstrap,luci-app-statistics,luci-app-upnp,luci-app-firewall,luci-app-wireguard,luci-app-wifi-schedule'
         type: string
       include_packages:
-        description: '功能包列表（非 LuCI，逗号分隔）'
+        description: '软件包（非 LuCI，逗号分隔）'
         required: false
         default: 'tailscale,iperf3,tcpdump,curl,wget,htop,nano'
         type: string
@@ -47,8 +47,24 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    permissions:
+      contents: write
     
     steps:
+    - name: 生成构建信息
+      id: build_info
+      run: |
+        BUILD_DATE=$(date +%Y%m%d-%H%M%S)
+        COMMIT_SHORT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+        
+        echo "BUILD_DATE=$BUILD_DATE" >> $GITHUB_ENV
+        echo "COMMIT_SHORT=$COMMIT_SHORT" >> $GITHUB_ENV
+        echo "RELEASE_TAG=build-$BUILD_DATE" >> $GITHUB_ENV
+        
+        echo "构建信息:"
+        echo "构建日期: $BUILD_DATE"
+        echo "提交哈希: $COMMIT_SHORT"
+
     - name: 检出 OpenWrt 源代码
       uses: actions/checkout@v4
       with:
@@ -73,7 +89,7 @@ jobs:
           ${{ runner.os }}-openwrt-
 
     - name: 设置 ccache
-      run: ccache -M 2G
+      run: ccache -M 5G
 
     - name: 初始化 feeds
       run: |
@@ -103,23 +119,64 @@ jobs:
         fi
         make defconfig
 
+    - name: 验证配置
+      run: |
+        echo "验证构建配置..."
+        if ! grep -q "CONFIG_TARGET_${{ github.event.inputs.target_arch }}=y" .config; then
+          echo "错误：目标架构配置验证失败"
+          exit 1
+        fi
+        if ! grep -q "CONFIG_TARGET_${{ github.event.inputs.target_arch }}_${{ github.event.inputs.device_model }}=y" .config; then
+          echo "错误：设备型号配置验证失败"
+          exit 1
+        fi
+        echo "配置验证通过"
+
     - name: 预下载软件包
       run: make download -j$(nproc)
+
+    - name: 磁盘空间监控
+      run: |
+        echo "构建前磁盘空间:"
+        df -h
+        echo "当前目录大小:"
+        du -sh .
 
     - name: 构建 OpenWrt 固件
       run: |
         mkdir -p $BUILD_LOG_DIR
         if [ "${{ github.event.inputs.verbose_build }}" = "true" ]; then
-          make V=s -j$(nproc)
+          make V=s -j$(nproc) 2>&1 | tee $BUILD_LOG_DIR/build.log
         else
-          make -j$(nproc)
+          make -j$(nproc) 2>&1 | tee $BUILD_LOG_DIR/build.log
         fi
 
-    - name: 上传构建产物
+    - name: 收集构建产物信息
+      if: success()
+      run: |
+        echo "构建产物列表:"
+        find bin/targets/ -type f \( -name "*.bin" -o -name "*.img" -o -name "*.gz" -o -name "*.manifest" \) | while read file; do
+          echo "产物: $file"
+          ls -lh "$file"
+        done
+        
+        # 生成构建摘要
+        echo "## 构建摘要" > $BUILD_LOG_DIR/build_summary.md
+        echo "- **构建日期**: ${{ env.BUILD_DATE }}" >> $BUILD_LOG_DIR/build_summary.md
+        echo "- **源码提交**: ${{ env.COMMIT_SHORT }}" >> $BUILD_LOG_DIR/build_summary.md
+        echo "- **目标架构**: ${{ github.event.inputs.target_arch }}" >> $BUILD_LOG_DIR/build_summary.md
+        echo "- **设备型号**: ${{ github.event.inputs.device_model }}" >> $BUILD_LOG_DIR/build_summary.md
+        echo "- **源码分支**: ${{ github.event.inputs.source_branch }}" >> $BUILD_LOG_DIR/build_summary.md
+        echo "" >> $BUILD_LOG_DIR/build_summary.md
+        echo "### 包含的软件包" >> $BUILD_LOG_DIR/build_summary.md
+        echo "- LuCI应用: ${{ github.event.inputs.include_luci_apps }}" >> $BUILD_LOG_DIR/build_summary.md
+        echo "- 软件包: ${{ github.event.inputs.include_packages }}" >> $BUILD_LOG_DIR/build_summary.md
+
+    - name: 上传构建产物至 Artifact
       if: success()
       uses: actions/upload-artifact@v4
       with:
-        name: openwrt-firmware
+        name: openwrt-firmware-${{ env.BUILD_DATE }}
         path: bin/targets/
         retention-days: 7
 
@@ -127,13 +184,54 @@ jobs:
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: build-logs
+        name: build-logs-${{ env.BUILD_DATE }}
         path: $BUILD_LOG_DIR/
         retention-days: 7
+
+    - name: 创建 GitHub Release
+      if: github.event.inputs.create_release == 'true' && success()
+      uses: ncipollo/release-action@v2
+      with:
+        tag: ${{ env.RELEASE_TAG }}
+        name: OpenWrt Build ${{ env.BUILD_DATE }}
+        body: |
+          # OpenWrt 自定义构建
+
+          ## 构建信息
+          - **构建日期**: ${{ env.BUILD_DATE }}
+          - **源码提交**: ${{ env.COMMIT_SHORT }}
+          - **目标架构**: ${{ github.event.inputs.target_arch }}
+          - **设备型号**: ${{ github.event.inputs.device_model }}
+          - **源码分支**: ${{ github.event.inputs.source_branch }}
+
+          ## 软件包配置
+          - **LuCI应用**: ${{ github.event.inputs.include_luci_apps }}
+          - **软件包**: ${{ github.event.inputs.include_packages }}
+
+          ## 构建参数
+          - **详细构建**: ${{ github.event.inputs.verbose_build }}
+          - **Release标签**: ${{ env.RELEASE_TAG }}
+
+          ---
+          此版本由 GitHub Actions 自动构建生成。
+        artifacts: "bin/targets/**/*,!bin/targets/**/*.log,!bin/targets/**/packages/**/*"
+        draft: false
+        prerelease: false
+        allowUpdates: true
+        replacesArtifacts: true
+        artifactErrorsFailBuild: false
 
     - name: 构建失败诊断信息
       if: failure()
       run: |
         echo "构建失败诊断信息:"
+        echo "当前目录内容:"
         ls -la
+        echo "配置文件前50行:"
         head -50 .config 2>/dev/null || echo "未找到配置文件"
+        echo "磁盘空间情况:"
+        df -h
+        echo "内存使用情况:"
+        free -h
+        echo "构建日志片段:"
+        tail -100 $BUILD_LOG_DIR/build.log 2>/dev/null || echo "未找到构建日志"
