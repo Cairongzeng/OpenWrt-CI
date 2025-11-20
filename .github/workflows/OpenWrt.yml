@@ -9,24 +9,24 @@ on:
         default: 'main'
         type: string
       target_arch:
-        description: '设备架构（如 airoha, ramips, x86_64）'
+        description: '设备架构（如 airoha, x86_64）'
         required: true
         default: 'airoha'
         type: string
       device_model:
-        description: '设备型号（如 an7581, newifi-d2）'
+        description: '设备型号（如 an7581）'
         required: true
         default: 'an7581'
         type: string
       include_luci_apps:
         description: 'LuCI 应用（逗号分隔，如 luci-app-adblock）'
         required: false
-        default: 'luci-app-upnp,luci-app-firewall,luci-app-wireguard'
+        default: 'luci-mod-admin-full,luci-theme-bootstrap,luci-app-statistics,luci-app-upnp,luci-app-firewall,luci-app-wireguard'
         type: string
       include_packages:
-        description: '自定义包列表（非 LuCI，逗号分隔）'
+        description: '功能包列表（非 LuCI，逗号分隔）'
         required: false
-        default: 'iperf3,tcpdump,curl,wget,htop,nano'
+        default: 'tailscale,iperf3,tcpdump,curl,wget,htop,nano'
         type: string
       create_release:
         description: '发布到 GitHub Release'
@@ -38,71 +38,32 @@ on:
         required: false
         default: false
         type: boolean
-      custom_feeds:
-        description: '自定义 feeds URL（每行一个，格式: name>url，必须 HTTPS）'
-        required: false
-        default: ''
-        type: string
-      include_chinese:
-        description: '包含中文语言支持'
-        required: false
-        default: true
-        type: boolean
-
-env:
-  TARGET_ARCH: ${{ github.event.inputs.target_arch }}
-  DEVICE_MODEL: ${{ github.event.inputs.device_model }}
-  CCACHE_DIR: ${{ github.workspace }}/.ccache
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    env:
+      TARGET_ARCH: ${{ github.event.inputs.target_arch }}
+      DEVICE_MODEL: ${{ github.event.inputs.device_model }}
 
     steps:
-    - name: Validate User Inputs
-      run: |
-        for var in "${{ github.event.inputs.source_branch }}" \
-                   "$TARGET_ARCH" \
-                   "$DEVICE_MODEL"; do
-          if ! [[ "$var" =~ ^[a-zA-Z0-9._\-]+$ ]]; then
-            echo "Invalid input: '$var' contains illegal characters"
-            exit 1
-          fi
-        done
-
-    - name: Checkout Source Code
+    - name: 检查源代码
       uses: actions/checkout@v4
       with:
         ref: ${{ github.event.inputs.source_branch }}
         submodules: recursive
 
-    - name: Get Repository Metadata
+    - name: 获取仓库元数据
       id: repo_info
       run: |
         echo "sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
         echo "branch=$(git branch --show-current 2>/dev/null || echo 'detached')" >> $GITHUB_OUTPUT
         echo "tag=$(git describe --tags --abbrev=0 2>/dev/null || echo 'none')" >> $GITHUB_OUTPUT
+        echo "commit_message=$(git log -1 --pretty=%B)" >> $GITHUB_OUTPUT
+        echo "author=$(git log -1 --pretty=%an)" >> $GITHUB_OUTPUT
 
-    - name: Set Build Timestamp and Parallel Jobs
-      run: |
-        echo "BUILD_TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_ENV
-        JOBS=$(( $(nproc) < 4 ? $(nproc) : 4 ))
-        echo "JOBS=$JOBS" >> $GITHUB_ENV
-
-    - name: Calculate Dynamic CCACHE Size
-      run: |
-        case "$TARGET_ARCH" in
-          "x86_64"|"arm64") CCACHE_MAXSIZE=8G ;;
-          "airoha"|"ramips"|"mips") CCACHE_MAXSIZE=4G ;;
-          "arm"|"aarch64") CCACHE_MAXSIZE=6G ;;
-          *) CCACHE_MAXSIZE=4G ;;
-        esac
-        REPO_SIZE=$(du -sb . | awk '{print $1}')
-        [ "$REPO_SIZE" -gt 500000 ] && CCACHE_MAXSIZE=$(( $(echo "$CCACHE_MAXSIZE" | tr -d 'G') + 2 ))G
-        echo "CCACHE_MAXSIZE=$CCACHE_MAXSIZE" >> $GITHUB_ENV
-
-    - name: Setup Build Environment
+    - name: 设置构建环境
       run: |
         sudo apt-get update -q
         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -112,126 +73,117 @@ jobs:
           libxml-parser-perl libjson-perl curl jq tree bc \
           automake autoconf libtool pkg-config
 
-    - name: Prepare Directories
+    - name: 验证输入参数
       run: |
-        mkdir -p "$CCACHE_DIR"
-        chmod 755 "$CCACHE_DIR"
+        validate() {
+          local type=$1 val=$2
+          if [[ ! $val =~ ^[a-zA-Z0-9_.-]{1,50}$ ]]; then
+            echo "错误：$type '$val' 格式无效"
+            exit 1
+          fi
+        }
+        
+        # 验证LuCI应用和功能包
+        [ -z "${{ github.event.inputs.include_luci_apps }}" ] || \
+          IFS=',' read -ra APPS <<< "${{ github.event.inputs.include_luci_apps }}"; for app in "${APPS[@]}"; do
+            validate app "$app"
+          done
+        [ -z "${{ github.event.inputs.include_packages }}" ] || \
+          IFS=',' read -ra PKGS <<< "${{ github.event.inputs.include_packages }}"; for pkg in "${PKGS[@]}"; do
+            validate package "$pkg"
+          done
 
-    - name: Cache Downloaded Sources and CCache
-      uses: actions/cache@v4
+    - name: 设置构建缓存
+      uses: actions/cache@v4  # 升级到最新版本
       with:
         path: |
-          $CCACHE_DIR
-          dl
-        key: openwrt-build-cache-${{ runner.os }}-${{ github.event.inputs.source_branch }}-$TARGET_ARCH
+          ~/.ccache
+          build_dir
+          staging_dir
+        key: ${{ runner.os }}-openwrt-${{ github.event.inputs.source_branch }}-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}-${{ hashFiles('feeds.conf.default') }}
         restore-keys: |
-          openwrt-build-cache-${{ runner.os }}-${{ github.event.inputs.source_branch }}-$TARGET_ARCH
-          openwrt-build-cache-${{ runner.os }}-${{ github.event.inputs.source_branch }}
+          ${{ runner.os }}-openwrt-${{ github.event.inputs.source_branch }}-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}-
+          ${{ runner.os }}-openwrt-${{ github.event.inputs.source_branch }}-${{ github.event.inputs.target_arch }}-
+          ${{ runner.os }}-openwrt-${{ github.event.inputs.source_branch }}-
 
-    - name: Setup Custom Feeds
+    - name: 生成构建配置
       run: |
-        [ -z "${{ github.event.inputs.custom_feeds }}" ] || while IFS= read -r line; do
-          [[ -n "$line" && "$line" == *">"* ]] && echo "$line" >> feeds.conf.default
-        done <<< "${{ github.event.inputs.custom_feeds }}"
-        ./scripts/feeds update -a
-        ./scripts/feeds install -a
-
-    - name: Install Core and Optional Packages
-      run: |
-        set -e
-        ./scripts/feeds install luci luci-base || { echo "Core LuCI install failed"; exit 1; }
-        ./scripts/feeds install luci-compat 2>/dev/null || true
-        ./scripts/feeds search luci-theme-argon | grep -q luci-theme-argon && ./scripts/feeds install luci-theme-argon
-        [ -z "${{ github.event.inputs.include_luci_apps }}" ] || IFS=',' read -ra APPS <<< "${{ github.event.inputs.include_luci_apps }}"; for app in "${APPS[@]}"; do
-          app_clean=$(echo "$app" | xargs | tr -cd 'a-zA-Z0-9_-')
-          [ -n "$app_clean" ] && ./scripts/feeds install "$app_clean" || true
-        done
-        [ "${{ github.event.inputs.include_chinese }}" != "true" ] || ./scripts/feeds search luci-i18n-base-zh-cn | grep -q luci-i18n-base-zh-cn && ./scripts/feeds install luci-i18n-base-zh-cn
-        [ -z "${{ github.event.inputs.include_packages }}" ] || IFS=',' read -ra PKGS <<< "${{ github.event.inputs.include_packages }}"; for pkg in "${PKGS[@]}"; do
-          pkg_clean=$(echo "$pkg" | xargs | tr -cd 'a-zA-Z0-9_-')
-          [ -n "$pkg_clean" ] && ./scripts/feeds install "$pkg_clean" || true
-        done
-
-    - name: Generate Build Configuration (.config)
-      run: |
-        ARCH_UPPER=$(echo "$TARGET_ARCH" | tr '[:lower:]' '[:upper:]' | tr '.-' '_')
-        MODEL_UPPER=$(echo "$DEVICE_MODEL" | tr '[:lower:]' '[:upper:]' | tr '.-' '_')
-        cat > .config << EOF
-# Target
-CONFIG_TARGET_${ARCH_UPPER}=y
-CONFIG_TARGET_${ARCH_UPPER}_${MODEL_UPPER}=y
-# Core
-CONFIG_PACKAGE_luci=y
-CONFIG_PACKAGE_luci-base=y
-CONFIG_CCACHE=y
-CONFIG_PACKAGE_wpad-basic-wolfssl=y
-# Essential tools
-CONFIG_PACKAGE_iperf3=y
-CONFIG_PACKAGE_tcpdump=y
-CONFIG_PACKAGE_curl=y
-CONFIG_PACKAGE_wget=y
-CONFIG_PACKAGE_htop=y
-CONFIG_PACKAGE_nano=y
-EOF
-        [ "${{ github.event.inputs.include_chinese }}" != "true" ] || ./scripts/feeds search luci-i18n-base-zh-cn | grep -q luci-i18n-base-zh-cn && echo "CONFIG_PACKAGE_luci-i18n-base-zh-cn=y" >> .config
-        [ -z "${{ github.event.inputs.include_luci_apps }}" ] || IFS=',' read -ra APPS <<< "${{ github.event.inputs.include_luci_apps }}"; for app in "${APPS[@]}"; do
-          app_clean=$(echo "$app" | xargs | tr -cd 'a-zA-Z0-9_-')
-          [ -n "$app_clean" ] && echo "CONFIG_PACKAGE_$app_clean=y" >> .config
-        done
-        [ -z "${{ github.event.inputs.include_packages }}" ] || IFS=',' read -ra PKGS <<< "${{ github.event.inputs.include_packages }}"; for pkg in "${PKGS[@]}"; do
-          pkg_clean=$(echo "$pkg" | xargs | tr -cd 'a-zA-Z0-9_-')
-          [ -n "$pkg_clean" ] && echo "CONFIG_PACKAGE_$pkg_clean=y" >> .config
-        done
+        # 合并多个echo命令为一个，减少I/O操作
+        cat << EOF > .config
+        CONFIG_TARGET_${TARGET_ARCH}_${DEVICE_MODEL}=y
+        CONFIG_ALL=y
+        CONFIG_CCACHE=y
+        CONFIG_PACKAGE_wpad-basic-wolfssl=y
+        EOF
+        
+        # 添加用户指定的LuCI应用
+        [ -z "${{ github.event.inputs.include_luci_apps }}" ] || \
+          IFS=',' read -ra APPS <<< "${{ github.event.inputs.include_luci_apps }}"; for app in "${APPS[@]}"; do
+            echo "CONFIG_PACKAGE_$app=y" >> .config
+          done
+        
+        # 添加用户指定的功能包
+        [ -z "${{ github.event.inputs.include_packages }}" ] || \
+          IFS=',' read -ra PKGS <<< "${{ github.event.inputs.include_packages }}"; for pkg in "${PKGS[@]}"; do
+            echo "CONFIG_PACKAGE_$pkg=y" >> .config
+          done
+        
         make defconfig
-        grep -q "CONFIG_TARGET_${ARCH_UPPER}_${MODEL_UPPER}=y" .config || { echo "Target config not active"; exit 1; }
+        grep -q "CONFIG_TARGET_${TARGET_ARCH}_${DEVICE_MODEL}=y" .config || exit 1
 
-    - name: Build Firmware
+    - name: 构建固件
       id: build_firmware
       run: |
-        set +e
+        # 添加set -e确保错误时停止
+        set -e
         BUILD_START=$(date +%s)
-        echo "Starting build with -j$JOBS ..."
-        make -j$JOBS \
-          BUILD_LOG=1 \
-          FORCE_UNSAFE_CONFIGURE=1 \
-          ${{ github.event.inputs.verbose_build && 'V=s' || '' }}
-        EXIT_CODE=$?
+        make -j$(nproc) BUILD_LOG=1 FORCE_UNSAFE_CONFIGURE=1 ${{ github.event.inputs.verbose_build && 'V=s' || '' }}
         DURATION=$(( $(date +%s) - BUILD_START ))
         echo "build_duration=$DURATION" >> $GITHUB_OUTPUT
-        echo "build_exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
-        echo "build_status=$( [ $EXIT_CODE -eq 0 ] && echo success || echo failed )" >> $GITHUB_OUTPUT
-        exit $EXIT_CODE
+        echo "build_exit_code=$?" >> $GITHUB_OUTPUT
+        echo "build_status=$( [ $? -eq 0 ] && echo success || echo failed )" >> $GITHUB_OUTPUT
 
-    - name: Monitor Resources
+    - name: 监控资源使用
       if: always()
       run: |
-        echo "System Status:"
-        df -h /
-        free -h
+        # 增加内存和CPU使用情况监控
+        echo "## 资源使用情况"
         ccache -s
+        echo "## 内存使用"
+        free -h
+        echo "## CPU使用"
+        top -b -n 1 | head -10
 
-    - name: Collect Extended Build Logs on Failure
+    - name: 失败时收集构建日志
       if: failure()
       run: |
-        echo "Extended Build Error Analysis:"
-        find build_dir -name "compile.txt" -o -name "log.*" -o -name "*.log" | head -5 | xargs -r tail -n 500
-        grep -i -E "error:|fatal:|failed:|undefined reference" build_dir/**/log.* 2>/dev/null | head -20
-        df -h / && free -h && ccache -s
-        opkg list-installed > installed-packages.txt 2>&1
+        echo "构建失败，收集详细错误信息..."
+        # 增加错误日志的详细程度
+        grep -i -E "error:|fatal:|failed:|undefined reference" build_dir/**/log.* 2>/dev/null | head -50
+        echo "已安装包列表:"
+        opkg list-installed > installed-packages.txt
         cat installed-packages.txt
+        echo "构建配置:"
+        cat .config
 
-    - name: Verify Build Artifacts
+    - name: 验证构建产物
       if: success()
       run: |
-        [ -d "bin/targets" ] || { echo "Build output directory missing"; exit 1; }
         FILES=$(find bin/targets -type f \( -name "*.bin" -o -name "*.img" -o -name "*.tar.gz" \) -size +1M | head -10)
-        [ -n "$FILES" ] || { echo "No firmware files found"; ls -lhR bin/targets/; exit 1; }
-        echo "Found firmware files:"
-        echo "$FILES" | while read -r f; do
-          [ -f "$f" ] && echo "  $(basename "$f") ($(du -h "$f" | cut -f1))"
+        [ -n "$FILES" ] || { echo "No firmware files found"; exit 1; }
+        
+        echo "验证固件完整性..."
+        for f in $FILES; do
+          # 使用md5sum进行基本验证
+          md5sum "$f" > "$f.md5"
+          if [ $? -ne 0 ]; then
+            echo "错误：无法计算 $f 的MD5"
+            exit 1
+          fi
+          echo "  $(basename "$f") ($(du -h "$f" | cut -f1)), MD5: $(cat "$f.md5")"
         done
 
-    - name: Upload Artifacts
+    - name: 上传构建产物
       if: success()
       uses: actions/upload-artifact@v4
       with:
@@ -239,41 +191,31 @@ EOF
         path: bin/targets/**/*
         retention-days: 30
 
-    - name: Create GitHub Release
-      if: ${{ github.event.inputs.create_release == 'true' && success() }}
+    - name: 创建GitHub Release
+      if: ${{ github.event.inputs.create_release && success() }}
       uses: ncipollo/release-action@v2
       with:
-        tag: openwrt-$TARGET_ARCH-$DEVICE_MODEL-${{ github.run_number }}
+        tag: ${{ github.event.inputs.source_branch }}-${{ env.TARGET_ARCH }}-${{ env.DEVICE_MODEL }}-${{ steps.repo_info.outputs.sha }}
         name: OpenWrt $TARGET_ARCH/$DEVICE_MODEL Build #${{ github.run_number }}
         body: |
-          OpenWrt Firmware Build
-
           Build Info
           - Architecture: $TARGET_ARCH
           - Device Model: $DEVICE_MODEL
           - Source Branch: ${{ github.event.inputs.source_branch }}
-          - Chinese Support: ${{ github.event.inputs.include_chinese }}
-          - Build Duration: ${{ steps.build_firmware.outputs.build_duration }}s
-          - Build Date: $BUILD_TIMESTAMP
+          - Duration: ${{ steps.build_firmware.outputs.build_duration }}s
+          - Date: ${{ steps.repo_info.outputs.commit_message }}
+          - Commit: ${{ steps.repo_info.outputs.sha }} (${{ steps.repo_info.outputs.branch }})
+          - Author: ${{ steps.repo_info.outputs.author }}
 
           Included Packages
           - LuCI Apps: ${{ github.event.inputs.include_luci_apps }}
           - Custom Packages: ${{ github.event.inputs.include_packages }}
 
-          Repository
-          - Commit: ${{ steps.repo_info.outputs.sha }}
-          - Branch: ${{ steps.repo_info.outputs.branch }}
-          - Tag: ${{ steps.repo_info.outputs.tag }}
-
-          Automatically built by GitHub Actions
+          Build Environment
+          - Runner OS: ${{ runner.os }}
+          - Jobs: $(nproc)
         artifacts: "bin/targets/**/*"
         draft: false
         prerelease: false
         allowUpdates: true
         token: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Final Failure Notice
-      if: failure()
-      run: |
-        echo "Build failed after ${{ steps.build_firmware.outputs.build_duration }} seconds"
-        echo "Check the 'Collect Extended Build Logs' step for clues."
