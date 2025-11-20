@@ -56,25 +56,10 @@ jobs:
         ref: ${{ github.event.inputs.source_branch }}
         submodules: true
 
-    - name: 验证源代码结构
-      run: |
-        echo "正在验证 OpenWrt 源代码结构"
-        
-        REQUIRED_FILES=("scripts/feeds" "feeds.conf.default" "Makefile")
-        for file in "${REQUIRED_FILES[@]}"; do
-          if [ -f "$file" ]; then
-            echo "✅ $file 存在"
-            [ "$file" = "scripts/feeds" ] && chmod +x "$file"
-          else
-            echo "❌ 错误: $file 不存在"
-            exit 1
-          fi
-        done
-
     - name: 安装构建依赖
       run: |
-        set -e
-        sudo apt-get update
+        echo "开始安装构建依赖..."
+        sudo apt-get update -y
         sudo apt-get install -y \
           build-essential clang flex bison g++ gawk gcc-multilib \
           g++-multilib gettext git libncurses5-dev libssl-dev \
@@ -89,6 +74,7 @@ jobs:
           libreadline-dev libpython3-dev ninja-build patch \
           python3-pyelftools qemu-utils scons squashfs-tools \
           subversion swig texinfo uglifyjs upx-ucl xmlto xxd
+        echo "✅ 依赖安装完成"
 
     - name: 配置构建缓存
       uses: actions/cache@v4
@@ -103,18 +89,21 @@ jobs:
 
     - name: 设置 ccache
       run: |
-        ccache -M 5G
+        echo "配置 ccache..."
+        ccache -M 2G
         ccache -s
+        echo "✅ ccache 配置完成"
 
     - name: 初始化 feeds
       run: |
-        set -e
+        echo "开始初始化 feeds..."
         ./scripts/feeds update -a
         ./scripts/feeds install -a
+        echo "✅ feeds 初始化完成"
 
     - name: 生成基础配置
       run: |
-        set -e
+        echo "生成基础配置..."
         # 创建基础配置
         {
           echo "CONFIG_TARGET_${{ github.event.inputs.target_arch }}=y"
@@ -123,10 +112,11 @@ jobs:
           echo "CONFIG_BUILD_LOG=y"
         } > .config
         make defconfig
+        echo "✅ 基础配置生成完成"
 
     - name: 自定义软件包配置
       run: |
-        set -e
+        echo "开始自定义软件包配置..."
         # 添加 LuCI 应用
         if [ -n "${{ github.event.inputs.include_luci_apps }}" ]; then
           IFS=',' read -ra APPS <<< "${{ github.event.inputs.include_luci_apps }}"
@@ -144,24 +134,36 @@ jobs:
         fi
         
         make defconfig
+        echo "✅ 自定义软件包配置完成"
 
     - name: 预下载软件包
       run: |
-        set -e
+        echo "开始预下载软件包..."
         make download -j$(nproc) || make download -j1
+        echo "✅ 软件包预下载完成"
 
     - name: 构建 OpenWrt 固件
       run: |
-        set -e
+        echo "开始构建 OpenWrt 固件..."
         mkdir -p $BUILD_LOG_DIR
         
-        # 根据输入设置构建选项
+        # 设置构建选项
+        BUILD_OPTIONS=""
         if [ "${{ github.event.inputs.verbose_build }}" = "true" ]; then
-          set -o pipefail
-          make V=s -j$(nproc) 2>&1 | tee $BUILD_LOG_DIR/build.log
+          BUILD_OPTIONS="V=s"
+          echo "启用详细构建输出"
+        fi
+        
+        # 执行构建
+        echo "使用选项构建: $BUILD_OPTIONS"
+        make -j$(nproc) $BUILD_OPTIONS
+        BUILD_EXIT_CODE=$?
+        
+        if [ $BUILD_EXIT_CODE -eq 0 ]; then
+          echo "✅ 构建成功完成"
         else
-          set -o pipefail
-          make -j$(nproc) 2>&1 | tee $BUILD_LOG_DIR/build.log
+          echo "❌ 构建失败，退出代码: $BUILD_EXIT_CODE"
+          exit $BUILD_EXIT_CODE
         fi
 
     - name: 上传构建产物
@@ -184,9 +186,7 @@ jobs:
       if: failure()
       run: |
         echo "构建失败诊断信息:"
-        echo "构建日志最后100行:"
-        tail -100 $BUILD_LOG_DIR/build.log 2>/dev/null || echo "未找到构建日志"
         echo "当前目录内容:"
         ls -la
-        echo "配置文件内容（前100行）:"
-        head -100 .config 2>/dev/null || echo "未找到配置文件"
+        echo "配置文件内容（前50行）:"
+        head -50 .config 2>/dev/null || echo "未找到配置文件"
