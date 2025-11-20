@@ -1,4 +1,4 @@
-name: OpenWrt 构建
+name: OpenWrt 源码编译
 
 on:
   workflow_dispatch:
