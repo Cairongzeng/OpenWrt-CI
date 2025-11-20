@@ -71,14 +71,30 @@ jobs:
     - name: 安装构建依赖
       run: |
         sudo apt-get update -q
+        sudo apt-get install -y software-properties-common
+        sudo add-apt-repository -y universe
+        sudo add-apt-repository -y multiverse
+        
+        # OpenWrt 官方推荐的构建依赖[citation:1]
         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-          build-essential ccache ecj fastjar file g++ gawk \
-          getgit libelf-dev libncurses5-dev libncursesw5-dev \
-          libssl-dev python3 unzip wget \
-          python3-setuptools rsync subversion swig time xsltproc \
-          zlib1g-dev clang flex bison gcc-multilib python3-pip \
-          python3-venv libxml-parser-perl libjson-perl curl jq \
-          tree bc automake autoconf libtool pkg-config ca-certificates
+          build-essential clang flex bison g++ gawk gcc-multilib \
+          g++-multilib gettext git libncurses5-dev libssl-dev \
+          python3-setuptools rsync unzip zlib1g-dev file wget \
+          make ccache ecj fastjar java-propose-classpath \
+          libxml-parser-perl libelf-dev autoconf automake \
+          libtool autopoint device-tree-compiler curl jq \
+          python3 python3-pip python3-venv python3-dev \
+          pkg-config bc kmod cpio
+
+        # 验证 Python 工具链
+        python3 --version
+        pip3 --version
+        which python3
+
+    - name: 初始化 feeds
+      run: |
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
 
     - name: 配置构建缓存
       uses: actions/cache@v4
@@ -88,40 +104,41 @@ jobs:
           build_dir
           staging_dir
           dl
-        key: ${{ runner.os }}-openwrt-${{ github.event.inputs.source_branch }}-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}-${{ hashFiles('feeds.conf', '.config', 'package/feeds/*/*/Makefile') }}
+        key: ${{ runner.os }}-openwrt-${{ github.event.inputs.source_branch }}-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}-${{ hashFiles('feeds.conf.default', '.config', 'package/feeds/*/*/Makefile') }}
         restore-keys: |
           ${{ runner.os }}-openwrt-${{ github.event.inputs.source_branch }}-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}-
           ${{ runner.os }}-openwrt-${{ github.event.inputs.source_branch }}-
 
-    - name: 初始化 feeds
+    - name: 设置ccache缓存
       run: |
-        ./scripts/feeds update -a
-        ./scripts/feeds install -a
+        echo "配置ccache缓存大小..."
+        ccache -M 10G
+        ccache -s
 
     - name: 生成基础配置
       run: |
-        # 生成默认配置
-        make defconfig
-        
-        # 应用自定义配置
-        cat << EOF >> .config
+        # 设置基础配置[citation:1]
+        cat << EOF > .config
         CONFIG_TARGET_${TARGET_ARCH}=y
         CONFIG_TARGET_${TARGET_ARCH}_${DEVICE_MODEL}=y
         CONFIG_CCACHE=y
         CONFIG_BUILD_LOG=y
         EOF
+        
+        # 生成完整默认配置
+        make defconfig
 
     - name: 配置软件包
       run: |
-        # 清理配置中的注释和空行
-        sed -i '/^#/d' .config
-        sed -i '/^$/d' .config
-        
         # 添加 LuCI 应用
         if [ -n "${{ github.event.inputs.include_luci_apps }}" ]; then
           IFS=',' read -ra APPS <<< "${{ github.event.inputs.include_luci_apps }}"
           for app in "${APPS[@]}"; do
-            echo "CONFIG_PACKAGE_${app}=y" >> .config
+            # 确保包名格式正确
+            pkg_name=$(echo "$app" | tr -d ' ')
+            if [ -n "$pkg_name" ]; then
+              echo "CONFIG_PACKAGE_${pkg_name}=y" >> .config
+            fi
           done
         fi
         
@@ -129,11 +146,14 @@ jobs:
         if [ -n "${{ github.event.inputs.include_packages }}" ]; then
           IFS=',' read -ra PKGS <<< "${{ github.event.inputs.include_packages }}"
           for pkg in "${PKGS[@]}"; do
-            echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+            pkg_name=$(echo "$pkg" | tr -d ' ')
+            if [ -n "$pkg_name" ]; then
+              echo "CONFIG_PACKAGE_${pkg_name}=y" >> .config
+            fi
           done
         fi
         
-        # 最终验证配置
+        # 最终验证和整理配置[citation:6]
         make defconfig
 
     - name: 显示构建配置摘要
@@ -147,6 +167,16 @@ jobs:
         echo ""
         echo "## 关键配置项"
         grep -E "CONFIG_TARGET|CONFIG_PACKAGE" .config | head -20
+        echo ""
+        echo "## 配置统计"
+        echo "总配置项: $(grep -c '^CONFIG_' .config || true)"
+        echo "启用的配置: $(grep -c '^CONFIG_.*=y' .config || true)"
+
+    - name: 下载源码包
+      run: |
+        echo "开始下载所需的源码包..."
+        make download -j$(nproc)
+        echo "下载完成"
 
     - name: 执行固件构建
       id: build_firmware
@@ -155,6 +185,7 @@ jobs:
         BUILD_START=$(date +%s)
         
         echo "::group::开始构建 OpenWrt 固件"
+        # 根据OpenWrt构建系统的最佳实践[citation:1]
         if [ "${{ github.event.inputs.verbose_build }}" = "true" ]; then
           make -j$(($(nproc) + 1)) V=s 2>&1 | tee build.log
         else
@@ -176,11 +207,11 @@ jobs:
         
         # 显示生成的固件文件
         echo "## 生成的固件文件"
-        find bin/targets -name "*.bin" -o -name "*.img" -o -name "*.gz" | sort
+        find bin/targets -name "*.bin" -o -name "*.img" -o -name "*.gz" 2>/dev/null | sort || echo "未找到固件文件"
         
         # 显示文件大小
         echo "## 文件大小"
-        find bin/targets -type f -name "*sysupgrade*" -exec ls -lh {} \;
+        find bin/targets -type f \( -name "*sysupgrade*" -o -name "*factory*" \) -exec ls -lh {} \; 2>/dev/null || echo "未找到系统升级文件"
         
         # ccache 统计
         echo "## CCache 统计"
