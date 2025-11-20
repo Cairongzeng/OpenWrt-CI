@@ -1,101 +1,279 @@
-name: OpenWrt 构建工作流
+name: OpenWrt Build
 
 on:
   workflow_dispatch:
     inputs:
-      include_chinese:
-        description: '包含中文语言支持（默认不勾选）'
+      source_branch:
+        description: '源码分支（如 main, openwrt-24.10）'
+        required: true
+        default: 'main'
+        type: string
+      target_arch:
+        description: '设备架构（如 airoha, ramips, x86_64）'
+        required: true
+        default: 'airoha'
+        type: string
+      device_model:
+        description: '设备型号（如 an7581, newifi-d2）'
+        required: true
+        default: 'an7581'
+        type: string
+      include_luci_apps:
+        description: 'LuCI 应用（逗号分隔，如 luci-app-adblock）'
+        required: false
+        default: 'luci-app-upnp,luci-app-firewall,luci-app-wireguard'
+        type: string
+      include_packages:
+        description: '自定义包列表（非 LuCI，逗号分隔）'
+        required: false
+        default: 'iperf3,tcpdump,curl,wget,htop,nano'
+        type: string
+      create_release:
+        description: '发布到 GitHub Release'
         required: false
         default: false
         type: boolean
-      create_release:
-        description: '创建GitHub发布版本'
+      verbose_build:
+        description: '启用详细构建输出（V=s）'
+        required: false
+        default: false
+        type: boolean
+      custom_feeds:
+        description: '自定义 feeds URL（每行一个，格式: name>url，必须 HTTPS）'
+        required: false
+        default: ''
+        type: string
+      include_chinese:
+        description: '包含中文语言支持'
         required: false
         default: true
         type: boolean
 
+env:
+  TARGET_ARCH: ${{ github.event.inputs.target_arch }}
+  DEVICE_MODEL: ${{ github.event.inputs.device_model }}
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 180
+
     steps:
-      - name: 检出仓库
-        uses: actions/checkout@v3
-
-      - name: 设置构建环境
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libncurses-dev gawk git libssl-dev wget unzip
-
-      - name: 初始化OpenWrt
-        run: |
-          git clone https://github.com/openwrt/openwrt.git
-          cd openwrt
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
-
-      - name: 安装中文语言支持
-        if: ${{ github.event.inputs.include_chinese == 'true' }}
-        run: |
-          cd openwrt
-          ./scripts/feeds install luci-i18n-base-zh-cn
-          ./scripts/feeds install luci-theme-argon
-          ./scripts/feeds install luci-app-adguardhome
-
-      - name: 生成构建配置 (.config)
-        run: |
-          cd openwrt
-          # 基础配置
-          echo "CONFIG_TARGET_x86=y" >> .config
-          echo "CONFIG_TARGET_x86_64=y" >> .config
-          echo "CONFIG_DEVEL=y" >> .config
-          
-          # 网络配置
-          echo "CONFIG_PACKAGE_luci=y" >> .config
-          echo "CONFIG_PACKAGE_luci-app-firewall=y" >> .config
-          
-          # 中文支持配置
-          if [ "${{ github.event.inputs.include_chinese }}" = "true" ]; then
-            ./scripts/feeds search luci-i18n-base-zh-cn | grep -q luci-i18n-base-zh-cn && echo "CONFIG_PACKAGE_luci-i18n-base-zh-cn=y" >> .config
-            echo "CONFIG_PACKAGE_luci-theme-argon=y" >> .config
-            echo "CONFIG_PACKAGE_luci-app-adguardhome=y" >> .config
+    - name: Validate User Inputs
+      run: |
+        for var in "${{ github.event.inputs.source_branch }}" \
+                   "$TARGET_ARCH" \
+                   "$DEVICE_MODEL"; do
+          if ! [[ "$var" =~ ^[a-zA-Z0-9._\-]+$ ]]; then
+            echo "Invalid input: '$var' contains illegal characters"
+            exit 1
           fi
-          
-          # 保存配置
-          make defconfig
+        done
 
-      - name: 构建OpenWrt
-        run: |
-          cd openwrt
-          make -j$(nproc)
+    - name: Checkout Source Code
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.inputs.source_branch }}
+        submodules: recursive
 
-      - name: 上传构件
-        uses: actions/upload-artifact@v3
-        with:
-          name: openwrt-build
-          path: openwrt/bin/targets/x86/64/
+    - name: Get Repository Metadata
+      id: repo_info
+      run: |
+        echo "sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+        echo "branch=$(git branch --show-current 2>/dev/null || echo 'detached')" >> $GITHUB_OUTPUT
+        echo "tag=$(git describe --tags --abbrev=0 2>/dev/null || echo 'none')" >> $GITHUB_OUTPUT
 
-      - name: 创建GitHub发布版本
-        if: ${{ github.event.inputs.create_release == 'true' && success() }}
-        uses: ncipollo/release-action@v2
-        with:
-          tag: ${{ github.ref }}
-          name: OpenWrt 构建版本 ${{ github.ref }}
-          body: |
-            # OpenWrt 构建发布
-            
-            ## 构建信息
-            - **构建日期**: ${{ github.run_id }}
-            - **提交**: ${{ github.sha }}
-            - **目标平台**: x86_64
-            
-            ## 功能特性
-            - **Web界面**: LuCI
-            - **中文支持**: ${{ github.event.inputs.include_chinese == 'true' && '已启用' || '未启用' }}
-            - **包含组件**:
-              - 基础: LuCI, 防火墙
-              - ${ github.event.inputs.include_chinese == 'true' && '- 中文: 基础语言包, Argon主题, AdGuardHome' || '' }
-            
-            ## 使用方法
-            1. 下载适合的镜像文件
-            2. 刷写到设备
-            3. 通过 http://192.168.1.1 访问
+    - name: Set Build Timestamp and Parallel Jobs
+      run: |
+        echo "BUILD_TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_ENV
+        JOBS=$(( $(nproc) < 4 ? $(nproc) : 4 ))
+        echo "JOBS=$JOBS" >> $GITHUB_ENV
+
+    - name: Calculate Dynamic CCACHE Size
+      run: |
+        case "$TARGET_ARCH" in
+          "x86_64"|"arm64") CCACHE_MAXSIZE=8G ;;
+          "airoha"|"ramips"|"mips") CCACHE_MAXSIZE=4G ;;
+          "arm"|"aarch64") CCACHE_MAXSIZE=6G ;;
+          *) CCACHE_MAXSIZE=4G ;;
+        esac
+        REPO_SIZE=$(du -sb . | awk '{print $1}')
+        [ "$REPO_SIZE" -gt 500000 ] && CCACHE_MAXSIZE=$(( $(echo "$CCACHE_MAXSIZE" | tr -d 'G') + 2 ))G
+        echo "CCACHE_MAXSIZE=$CCACHE_MAXSIZE" >> $GITHUB_ENV
+
+    - name: Setup Build Environment
+      run: |
+        sudo apt-get update -q
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          build-essential clang flex bison g++ gcc-multilib gettext git \
+          libncurses-dev libssl-dev python3 python3-pip python3-venv \
+          rsync unzip wget zlib1g-dev file time ccache subversion \
+          libxml-parser-perl libjson-perl curl jq tree bc \
+          automake autoconf libtool pkg-config
+
+    - name: Prepare Directories
+      run: |
+        mkdir -p "$CCACHE_DIR"
+        chmod 755 "$CCACHE_DIR"
+
+    - name: Cache Downloaded Sources and CCache
+      uses: actions/cache@v4
+      with:
+        path: |
+          $CCACHE_DIR
+          dl
+        key: openwrt-build-cache-${{ runner.os }}-${{ github.event.inputs.source_branch }}-$TARGET_ARCH
+        restore-keys: |
+          openwrt-build-cache-${{ runner.os }}-${{ github.event.inputs.source_branch }}-$TARGET_ARCH
+          openwrt-build-cache-${{ runner.os }}-${{ github.event.inputs.source_branch }}
+
+    - name: Setup Custom Feeds
+      run: |
+        [ -z "${{ github.event.inputs.custom_feeds }}" ] || while IFS= read -r line; do
+          [[ -n "$line" && "$line" == *">"* ]] && echo "$line" >> feeds.conf.default
+        done <<< "${{ github.event.inputs.custom_feeds }}"
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: Install Core and Optional Packages
+      run: |
+        set -e
+        ./scripts/feeds install luci luci-base || { echo "Core LuCI install failed"; exit 1; }
+        ./scripts/feeds install luci-compat 2>/dev/null || true
+        ./scripts/feeds search luci-theme-argon | grep -q luci-theme-argon && ./scripts/feeds install luci-theme-argon
+        [ -z "${{ github.event.inputs.include_luci_apps }}" ] || IFS=',' read -ra APPS <<< "${{ github.event.inputs.include_luci_apps }}"; for app in "${APPS[@]}"; do
+          app_clean=$(echo "$app" | xargs | tr -cd 'a-zA-Z0-9_-')
+          [ -n "$app_clean" ] && ./scripts/feeds install "$app_clean" || true
+        done
+        [ "${{ github.event.inputs.include_chinese }}" != "true" ] || ./scripts/feeds search luci-i18n-base-zh-cn | grep -q luci-i18n-base-zh-cn && ./scripts/feeds install luci-i18n-base-zh-cn
+        [ -z "${{ github.event.inputs.include_packages }}" ] || IFS=',' read -ra PKGS <<< "${{ github.event.inputs.include_packages }}"; for pkg in "${PKGS[@]}"; do
+          pkg_clean=$(echo "$pkg" | xargs | tr -cd 'a-zA-Z0-9_-')
+          [ -n "$pkg_clean" ] && ./scripts/feeds install "$pkg_clean" || true
+        done
+
+    - name: Generate Build Configuration (.config)
+      run: |
+        ARCH_UPPER=$(echo "$TARGET_ARCH" | tr '[:lower:]' '[:upper:]' | tr '.-' '_')
+        MODEL_UPPER=$(echo "$DEVICE_MODEL" | tr '[:lower:]' '[:upper:]' | tr '.-' '_')
+        cat > .config << EOF
+# Target
+CONFIG_TARGET_${ARCH_UPPER}=y
+CONFIG_TARGET_${ARCH_UPPER}_${MODEL_UPPER}=y
+# Core
+CONFIG_PACKAGE_luci=y
+CONFIG_PACKAGE_luci-base=y
+CONFIG_CCACHE=y
+CONFIG_PACKAGE_wpad-basic-wolfssl=y
+# Essential tools
+CONFIG_PACKAGE_iperf3=y
+CONFIG_PACKAGE_tcpdump=y
+CONFIG_PACKAGE_curl=y
+CONFIG_PACKAGE_wget=y
+CONFIG_PACKAGE_htop=y
+CONFIG_PACKAGE_nano=y
+EOF
+        [ "${{ github.event.inputs.include_chinese }}" != "true" ] || ./scripts/feeds search luci-i18n-base-zh-cn | grep -q luci-i18n-base-zh-cn && echo "CONFIG_PACKAGE_luci-i18n-base-zh-cn=y" >> .config
+        [ -z "${{ github.event.inputs.include_luci_apps }}" ] || IFS=',' read -ra APPS <<< "${{ github.event.inputs.include_luci_apps }}"; for app in "${APPS[@]}"; do
+          app_clean=$(echo "$app" | xargs | tr -cd 'a-zA-Z0-9_-')
+          [ -n "$app_clean" ] && echo "CONFIG_PACKAGE_$app_clean=y" >> .config
+        done
+        [ -z "${{ github.event.inputs.include_packages }}" ] || IFS=',' read -ra PKGS <<< "${{ github.event.inputs.include_packages }}"; for pkg in "${PKGS[@]}"; do
+          pkg_clean=$(echo "$pkg" | xargs | tr -cd 'a-zA-Z0-9_-')
+          [ -n "$pkg_clean" ] && echo "CONFIG_PACKAGE_$pkg_clean=y" >> .config
+        done
+        make defconfig
+        grep -q "CONFIG_TARGET_${ARCH_UPPER}_${MODEL_UPPER}=y" .config || { echo "Target config not active"; exit 1; }
+
+    - name: Build Firmware
+      id: build_firmware
+      run: |
+        set +e
+        BUILD_START=$(date +%s)
+        echo "Starting build with -j$JOBS ..."
+        make -j$JOBS \
+          BUILD_LOG=1 \
+          FORCE_UNSAFE_CONFIGURE=1 \
+          ${{ github.event.inputs.verbose_build && 'V=s' || '' }}
+        EXIT_CODE=$?
+        DURATION=$(( $(date +%s) - BUILD_START ))
+        echo "build_duration=$DURATION" >> $GITHUB_OUTPUT
+        echo "build_exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+        echo "build_status=$( [ $EXIT_CODE -eq 0 ] && echo success || echo failed )" >> $GITHUB_OUTPUT
+        exit $EXIT_CODE
+
+    - name: Monitor Resources
+      if: always()
+      run: |
+        echo "System Status:"
+        df -h /
+        free -h
+        ccache -s
+
+    - name: Collect Extended Build Logs on Failure
+      if: failure()
+      run: |
+        echo "Extended Build Error Analysis:"
+        find build_dir -name "compile.txt" -o -name "log.*" -o -name "*.log" | head -5 | xargs -r tail -n 500
+        grep -i -E "error:|fatal:|failed:|undefined reference" build_dir/**/log.* 2>/dev/null | head -20
+        df -h / && free -h && ccache -s
+        opkg list-installed > installed-packages.txt 2>&1
+        cat installed-packages.txt
+
+    - name: Verify Build Artifacts
+      if: success()
+      run: |
+        [ -d "bin/targets" ] || { echo "Build output directory missing"; exit 1; }
+        FILES=$(find bin/targets -type f \( -name "*.bin" -o -name "*.img" -o -name "*.tar.gz" \) -size +1M | head -10)
+        [ -n "$FILES" ] || { echo "No firmware files found"; ls -lhR bin/targets/; exit 1; }
+        echo "Found firmware files:"
+        echo "$FILES" | while read -r f; do
+          [ -f "$f" ] && echo "  $(basename "$f") ($(du -h "$f" | cut -f1))"
+        done
+
+    - name: Upload Artifacts
+      if: success()
+      uses: actions/upload-artifact@v4
+      with:
+        name: openwrt-$TARGET_ARCH-$DEVICE_MODEL
+        path: bin/targets/**/*
+        retention-days: 30
+
+    - name: Create GitHub Release
+      if: ${{ github.event.inputs.create_release == 'true' && success() }}
+      uses: ncipollo/release-action@v2
+      with:
+        tag: openwrt-$TARGET_ARCH-$DEVICE_MODEL-${{ github.run_number }}
+        name: OpenWrt $TARGET_ARCH/$DEVICE_MODEL Build #${{ github.run_number }}
+        body: |
+          OpenWrt Firmware Build
+
+          Build Info
+          - Architecture: $TARGET_ARCH
+          - Device Model: $DEVICE_MODEL
+          - Source Branch: ${{ github.event.inputs.source_branch }}
+          - Chinese Support: ${{ github.event.inputs.include_chinese }}
+          - Build Duration: ${{ steps.build_firmware.outputs.build_duration }}s
+          - Build Date: $BUILD_TIMESTAMP
+
+          Included Packages
+          - LuCI Apps: ${{ github.event.inputs.include_luci_apps }}
+          - Custom Packages: ${{ github.event.inputs.include_packages }}
+
+          Repository
+          - Commit: ${{ steps.repo_info.outputs.sha }}
+          - Branch: ${{ steps.repo_info.outputs.branch }}
+          - Tag: ${{ steps.repo_info.outputs.tag }}
+
+          Automatically built by GitHub Actions
+        artifacts: "bin/targets/**/*"
+        draft: false
+        prerelease: false
+        allowUpdates: true
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Final Failure Notice
+      if: failure()
+      run: |
+        echo "Build failed after ${{ steps.build_firmware.outputs.build_duration }} seconds"
+        echo "Check the 'Collect Extended Build Logs' step for clues."
