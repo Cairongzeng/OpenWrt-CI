@@ -40,233 +40,147 @@ on:
         type: boolean
 
 env:
-  CCACHE_DIR: /tmp/ccache
+  CCACHE_DIR: ~/.ccache
   BUILD_LOG_DIR: build_logs
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 180
-    env:
-      TARGET_ARCH: ${{ github.event.inputs.target_arch }}
-      DEVICE_MODEL: ${{ github.event.inputs.device_model }}
-
+    
     steps:
     - name: 检出OpenWrt源代码
       uses: actions/checkout@v4
       with:
+        repository: openwrt/openwrt
         ref: ${{ github.event.inputs.source_branch }}
         submodules: recursive
+        fetch-depth: 0
 
-    - name: 获取仓库元数据
-      id: repo_info
+    - name: 验证源代码结构
       run: |
-        echo "sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
-        echo "branch=$(git branch --show-current || echo 'detached')" >> $GITHUB_OUTPUT
-        echo "tag=$(git describe --tags --abbrev=0 2>/dev/null || echo 'none')" >> $GITHUB_OUTPUT
-        echo "commit_message=$(git log -1 --pretty=%B | head -n1)" >> $GITHUB_OUTPUT
-        echo "author=$(git log -1 --pretty=%an)" >> $GITHUB_OUTPUT
-        echo "date=$(date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
+        echo "## 验证 OpenWrt 源代码结构"
+        echo "工作目录: $(pwd)"
+        
+        # 检查关键文件
+        REQUIRED_FILES=("scripts/feeds" "feeds.conf.default" "rules.mk" "Makefile")
+        for file in "${REQUIRED_FILES[@]}"; do
+          if [ -f "$file" ]; then
+            echo "✅ $file 存在"
+            if [[ "$file" == *"feeds" ]]; then
+              chmod +x "$file"
+            fi
+          else
+            echo "❌ 错误: $file 不存在"
+            exit 1
+          fi
+        done
 
     - name: 安装构建依赖
       run: |
         sudo apt-get update -q
-        sudo apt-get install -y software-properties-common
-        sudo add-apt-repository -y universe
-        sudo add-apt-repository -y multiverse
-        
-        # OpenWrt 官方推荐的构建依赖[citation:1]
+        # OpenWrt 官方推荐的构建依赖
         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
           build-essential clang flex bison g++ gawk gcc-multilib \
           g++-multilib gettext git libncurses5-dev libssl-dev \
           python3-setuptools rsync unzip zlib1g-dev file wget \
-          make ccache ecj fastjar java-propose-classpath \
-          libxml-parser-perl libelf-dev autoconf automake \
-          libtool autopoint device-tree-compiler curl jq \
-          python3 python3-pip python3-venv python3-dev \
-          pkg-config bc kmod cpio
-
-        # 验证 Python 工具链
-        python3 --version
-        pip3 --version
-        which python3
-
-    - name: 初始化 feeds
-      run: |
-        ./scripts/feeds update -a
-        ./scripts/feeds install -a
+          make ccache
 
     - name: 配置构建缓存
       uses: actions/cache@v4
       with:
         path: |
           ~/.ccache
+          dl
           build_dir
           staging_dir
-          dl
-        key: ${{ runner.os }}-openwrt-${{ github.event.inputs.source_branch }}-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}-${{ hashFiles('feeds.conf.default', '.config', 'package/feeds/*/*/Makefile') }}
+        key: ${{ runner.os }}-openwrt-${{ github.event.inputs.source_branch }}-${{ hashFiles('feeds.conf.default') }}
         restore-keys: |
-          ${{ runner.os }}-openwrt-${{ github.event.inputs.source_branch }}-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}-
           ${{ runner.os }}-openwrt-${{ github.event.inputs.source_branch }}-
+          ${{ runner.os }}-openwrt-
 
     - name: 设置ccache缓存
       run: |
-        echo "配置ccache缓存大小..."
         ccache -M 10G
         ccache -s
 
+    - name: 初始化feeds
+      run: |
+        chmod +x scripts/feeds
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
     - name: 生成基础配置
       run: |
-        # 设置基础配置[citation:1]
-        cat << EOF > .config
-        CONFIG_TARGET_${TARGET_ARCH}=y
-        CONFIG_TARGET_${TARGET_ARCH}_${DEVICE_MODEL}=y
-        CONFIG_CCACHE=y
-        CONFIG_BUILD_LOG=y
-        EOF
+        set -e
         
-        # 生成完整默认配置
+        # 创建基础配置
+        cat << EOF > .config
+CONFIG_TARGET_${{ github.event.inputs.target_arch }}=y
+CONFIG_TARGET_${{ github.event.inputs.target_arch }}_${{ github.event.inputs.device_model }}=y
+CONFIG_CCACHE=y
+CONFIG_BUILD_LOG=y
+EOF
+        
         make defconfig
 
-    - name: 配置软件包
+    - name: 自定义软件包配置
       run: |
-        # 添加 LuCI 应用
+        set -e
+        
+        # 添加LuCI应用
         if [ -n "${{ github.event.inputs.include_luci_apps }}" ]; then
-          IFS=',' read -ra APPS <<< "${{ github.event.inputs.include_luci_apps }}"
-          for app in "${APPS[@]}"; do
-            # 确保包名格式正确
-            pkg_name=$(echo "$app" | tr -d ' ')
-            if [ -n "$pkg_name" ]; then
-              echo "CONFIG_PACKAGE_${pkg_name}=y" >> .config
-            fi
+          IFS=',' read -ra LUCI_APPS <<< "${{ github.event.inputs.include_luci_apps }}"
+          for app in "${LUCI_APPS[@]}"; do
+            echo "CONFIG_PACKAGE_${app}=y" >> .config
           done
         fi
         
         # 添加功能包
         if [ -n "${{ github.event.inputs.include_packages }}" ]; then
-          IFS=',' read -ra PKGS <<< "${{ github.event.inputs.include_packages }}"
-          for pkg in "${PKGS[@]}"; do
-            pkg_name=$(echo "$pkg" | tr -d ' ')
-            if [ -n "$pkg_name" ]; then
-              echo "CONFIG_PACKAGE_${pkg_name}=y" >> .config
-            fi
+          IFS=',' read -ra PACKAGES <<< "${{ github.event.inputs.include_packages }}"
+          for pkg in "${PACKAGES[@]}"; do
+            echo "CONFIG_PACKAGE_${pkg}=y" >> .config
           done
         fi
         
-        # 最终验证和整理配置[citation:6]
         make defconfig
 
-    - name: 显示构建配置摘要
-      run: |
-        echo "## 构建配置摘要"
-        echo "目标架构: $TARGET_ARCH"
-        echo "设备型号: $DEVICE_MODEL"
-        echo "源码分支: ${{ github.event.inputs.source_branch }}"
-        echo "包含的 LuCI 应用: ${{ github.event.inputs.include_luci_apps }}"
-        echo "包含的功能包: ${{ github.event.inputs.include_packages }}"
-        echo ""
-        echo "## 关键配置项"
-        grep -E "CONFIG_TARGET|CONFIG_PACKAGE" .config | head -20
-        echo ""
-        echo "## 配置统计"
-        echo "总配置项: $(grep -c '^CONFIG_' .config || true)"
-        echo "启用的配置: $(grep -c '^CONFIG_.*=y' .config || true)"
-
-    - name: 下载源码包
-      run: |
-        echo "开始下载所需的源码包..."
-        make download -j$(nproc)
-        echo "下载完成"
-
-    - name: 执行固件构建
-      id: build_firmware
+    - name: 预下载软件包
       run: |
         set -e
-        BUILD_START=$(date +%s)
-        
-        echo "::group::开始构建 OpenWrt 固件"
-        # 根据OpenWrt构建系统的最佳实践[citation:1]
-        if [ "${{ github.event.inputs.verbose_build }}" = "true" ]; then
-          make -j$(($(nproc) + 1)) V=s 2>&1 | tee build.log
-        else
-          make -j$(($(nproc) + 1)) 2>&1 | tee build.log
-        fi
-        echo "::endgroup::"
-        
-        BUILD_END=$(date +%s)
-        DURATION=$((BUILD_END - BUILD_START))
-        echo "build_duration=$DURATION" >> $GITHUB_OUTPUT
-        echo "build_status=success" >> $GITHUB_OUTPUT
+        make download -j$(nproc) || make download -j1
 
-    - name: 收集构建信息
-      if: success()
+    - name: 构建OpenWrt固件
       run: |
-        echo "## 构建完成信息"
-        echo "构建时长: ${{ steps.build_firmware.outputs.build_duration }} 秒"
-        echo "构建时间: $(date)"
+        set -e
+        mkdir -p $BUILD_LOG_DIR
         
-        # 显示生成的固件文件
-        echo "## 生成的固件文件"
-        find bin/targets -name "*.bin" -o -name "*.img" -o -name "*.gz" 2>/dev/null | sort || echo "未找到固件文件"
+        BUILD_OPTIONS=""
+        if [ "${{ github.event.inputs.verbose_build }}" = "true" ]; then
+          BUILD_OPTIONS="V=s"
+        fi
         
-        # 显示文件大小
-        echo "## 文件大小"
-        find bin/targets -type f \( -name "*sysupgrade*" -o -name "*factory*" \) -exec ls -lh {} \; 2>/dev/null || echo "未找到系统升级文件"
-        
-        # ccache 统计
-        echo "## CCache 统计"
-        ccache -s
-
-    - name: 上传构建日志
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: build-logs-$TARGET_ARCH-$DEVICE_MODEL
-        path: |
-          build.log
-          logs/
-        retention-days: 3
+        make -j$(nproc) $BUILD_OPTIONS 2>&1 | tee $BUILD_LOG_DIR/build.log || {
+          echo "构建失败，最后100行日志:"
+          tail -100 $BUILD_LOG_DIR/build.log
+          exit 1
+        }
 
     - name: 上传构建产物
       if: success()
       uses: actions/upload-artifact@v4
       with:
-        name: firmware-$TARGET_ARCH-$DEVICE_MODEL
+        name: openwrt-binaries
         path: |
-          bin/targets/$TARGET_ARCH/**/*
+          bin/targets/**
         retention-days: 7
-        compression-level: 0
 
-    - name: 创建GitHub Release
-      if: ${{ github.event.inputs.create_release && success() }}
-      uses: softprops/action-gh-release@v1
+    - name: 上传构建日志
+      if: always()
+      uses: actions/upload-artifact@v4
       with:
-        tag_name: build-${{ steps.repo_info.outputs.date }}-${{ steps.repo_info.outputs.sha }}
-        name: "OpenWrt $TARGET_ARCH/$DEVICE_MODEL Build"
-        body: |
-          ## 构建信息
-          
-          **设备信息**
-          - 架构: $TARGET_ARCH
-          - 型号: $DEVICE_MODEL
-          
-          **源码信息**  
-          - 分支: ${{ github.event.inputs.source_branch }}
-          - 提交: ${{ steps.repo_info.outputs.sha }}
-          - 作者: ${{ steps.repo_info.outputs.author }}
-          - 时间: ${{ steps.repo_info.outputs.date }}
-          
-          **构建配置**
-          - 构建时长: ${{ steps.build_firmware.outputs.build_duration }}秒
-          - LuCI应用: ${{ github.event.inputs.include_luci_apps }}
-          - 功能包: ${{ github.event.inputs.include_packages }}
-          
-          **包含文件**
-          - 系统固件
-          - 软件包索引
-          - 配置文件
-        files: |
-          bin/targets/$TARGET_ARCH/**/openwrt-*
-          bin/targets/$TARGET_ARCH/**/packages/*
-        draft: false
-        prerelease: false
+        name: build-logs
+        path: |
+          $BUILD_LOG_DIR/
+        retention-days: 7
