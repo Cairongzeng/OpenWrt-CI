@@ -1,4 +1,4 @@
-name: OpenWrt Free Firmware
+name: OpenWrt Firmware
 
 on:
   workflow_dispatch:
@@ -21,7 +21,7 @@ on:
       packages:
         description: '软件列表（逗号分隔）'
         required: false
-        default: 'luci-mod-admin-full,luci-theme-bootstrap,luci-app-statistics,luci-app-upnp,luci-app-firewall,luci-app-wireguard,luci-app-wifi-schedule,tailscale,iperf3,tcpdump,curl,wget,htop,nano'
+        default: 'luci,luci-ssl,luci-mod-admin-full,luci-theme-bootstrap,luci-i18n-base-zh-cn,luci-app-firewall,luci-app-upnp,luci-app-wireguard,luci-app-statistics,luci-app-wifi-schedule,luci-app-miot,luci-app-dlnacast,dlnacast,tailscale,iperf3,tcpdump,curl,wget,htop,nano'
         type: string
       create_release:
         description: '发布到 GitHub Release'
@@ -94,7 +94,7 @@ jobs:
         echo "CONFIG_TARGET_${{ github.event.inputs.target_arch }}_${{ github.event.inputs.device_model }}=y" >> .config
         echo "CONFIG_CCACHE=y" >> .config
         
-        # 处理包配置
+        # 处理用户包配置
         PACKAGES="${{ github.event.inputs.packages }}"
         if [ -n "$PACKAGES" ]; then
           echo "$PACKAGES" | tr ',' '\n' | while read pkg; do
@@ -103,6 +103,16 @@ jobs:
         fi
         
         make defconfig
+
+    - name: 验证包配置
+      run: |
+        echo "已配置的包列表:"
+        grep "CONFIG_PACKAGE" .config | grep "=y" | head -20
+        echo "..."
+        echo "总包数量: $(grep "CONFIG_PACKAGE" .config | grep "=y" | wc -l)"
+        
+        echo "中文语言包配置:"
+        grep "luci-i18n.*zh-cn" .config | grep "=y" || echo "无中文语言包"
 
     - name: 下载依赖
       run: make download -j$JOBS
