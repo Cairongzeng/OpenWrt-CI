@@ -37,7 +37,6 @@ on:
 env:
   CCACHE_DIR: /tmp/ccache
   BUILD_LOG_DIR: build_logs
-  JOBS: $(nproc)
 
 jobs:
   build:
@@ -51,6 +50,7 @@ jobs:
       run: |
         echo "BUILD_DATE=$(date +%Y%m%d-%H%M%S)" >> $GITHUB_ENV
         echo "RELEASE_TAG=build-$(date +%Y%m%d-%H%M%S)" >> $GITHUB_ENV
+        echo "JOBS=$(nproc)" >> $GITHUB_ENV
 
     - name: 检出源码
       uses: actions/checkout@v4
@@ -115,15 +115,15 @@ jobs:
         grep "luci-i18n.*zh-cn" .config | grep "=y" || echo "无中文语言包"
 
     - name: 下载依赖
-      run: make download -j$JOBS
+      run: make download -j$(nproc)
 
     - name: 构建固件
       run: |
         mkdir -p $BUILD_LOG_DIR
         if [ "${{ github.event.inputs.verbose_build }}" = "true" ]; then
-          make V=s -j$JOBS 2>&1 | tee $BUILD_LOG_DIR/build.log
+          make V=s -j$(nproc) 2>&1 | tee $BUILD_LOG_DIR/build.log
         else
-          make -j$JOBS 2>&1 | tee $BUILD_LOG_DIR/build.log
+          make -j$(nproc) 2>&1 | tee $BUILD_LOG_DIR/build.log
         fi
 
     - name: 上传产物
