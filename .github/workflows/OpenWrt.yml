@@ -61,17 +61,11 @@ jobs:
 
     - name: 配置 Feeds
       run: |
-        cat > feeds.conf.default << 'EOF'
-src-git packages https://git.openwrt.org/feed/packages.git
-src-git luci https://git.openwrt.org/project/luci.git
-src-git routing https://git.openwrt.org/feed/routing.git
-src-git telephony https://git.openwrt.org/feed/telephony.git
-src-git coolsnowwolf https://github.com/coolsnowwolf/packages
-src-git coolsnowwolf_luci https://github.com/coolsnowwolf/luci
-src-git kenzo https://github.com/kenzok8/openwrt-packages
-src-git small https://github.com/kenzok8/small
-src-git lienol https://github.com/Lienol/openwrt-package
-EOF
+        echo 'src-git coolsnowwolf https://github.com/coolsnowwolf/packages' >> feeds.conf.default
+        echo 'src-git coolsnowwolf_luci https://github.com/coolsnowwolf/luci' >> feeds.conf.default
+        echo 'src-git kenzo https://github.com/kenzok8/openwrt-packages' >> feeds.conf.default
+        echo 'src-git small https://github.com/kenzok8/small' >> feeds.conf.default
+        echo 'src-git lienol https://github.com/Lienol/openwrt-package' >> feeds.conf.default
 
     - name: 安装依赖
       run: |
@@ -100,9 +94,10 @@ EOF
         echo "CONFIG_TARGET_${{ github.event.inputs.target_arch }}_${{ github.event.inputs.device_model }}=y" >> .config
         echo "CONFIG_CCACHE=y" >> .config
         
-        if [ -n "${{ github.event.inputs.packages }}" ]; then
-          IFS=',' read -ra PKGS <<< "${{ github.event.inputs.packages }}"
-          for pkg in "${PKGS[@]}"; do
+        # 处理包配置
+        PACKAGES="${{ github.event.inputs.packages }}"
+        if [ -n "$PACKAGES" ]; then
+          echo "$PACKAGES" | tr ',' '\n' | while read pkg; do
             echo "CONFIG_PACKAGE_${pkg}=y" >> .config
           done
         fi
