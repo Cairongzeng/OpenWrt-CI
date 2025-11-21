@@ -36,6 +36,7 @@ on:
 
 env:
   CCACHE_DIR: /tmp/ccache
+  BUILD_LOG_DIR: build_logs
   JOBS: $(nproc)
 
 jobs:
@@ -46,33 +47,42 @@ jobs:
       contents: write
     
     steps:
-    - name: 检出源码并初始化
+    - name: 初始化环境
+      run: |
+        echo "BUILD_DATE=$(date +%Y%m%d-%H%M%S)" >> $GITHUB_ENV
+        echo "RELEASE_TAG=build-$(date +%Y%m%d-%H%M%S)" >> $GITHUB_ENV
+
+    - name: 检出源码
       uses: actions/checkout@v4
       with:
         repository: openwrt/openwrt
         ref: ${{ github.event.inputs.source_branch }}
         submodules: recursive
 
-    - name: 配置环境和依赖
+    - name: 配置优化的 Feeds
       run: |
-        # 设置构建信息
-        echo "BUILD_DATE=$(date +%Y%m%d-%H%M%S)" >> $GITHUB_ENV
-        echo "RELEASE_TAG=build-$(date +%Y%m%d-%H%M%S)" >> $GITHUB_ENV
-        
-        # 配置 feeds
-        cat >> feeds.conf.default << 'EOF'
+        # 重写 feeds.conf.default，官方源优先
+        cat > feeds.conf.default << 'EOF'
+# 官方核心仓库 - 最高优先级
+src-git packages https://git.openwrt.org/feed/packages.git
+src-git luci https://git.openwrt.org/project/luci.git
+src-git routing https://git.openwrt.org/feed/routing.git
+src-git telephony https://git.openwrt.org/feed/telephony.git
+
+# 第三方补充仓库 - 按稳定性排序
 src-git coolsnowwolf https://github.com/coolsnowwolf/packages
 src-git coolsnowwolf_luci https://github.com/coolsnowwolf/luci
 src-git kenzo https://github.com/kenzok8/openwrt-packages
 src-git small https://github.com/kenzok8/small
 src-git lienol https://github.com/Lienol/openwrt-package
 EOF
+        echo "✅ Feeds 配置完成 - 官方仓库优先级最高"
 
-        # 安装依赖
+    - name: 安装依赖
+      run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential clang flex bison g++ gawk \
-          gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
-          python3-setuptools rsync unzip zlib1g-dev file wget
+        sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+          gettext git libncurses5-dev libssl-dev python3-setuptools rsync unzip zlib1g-dev file wget
 
     - name: 配置缓存
       uses: actions/cache@v4
@@ -80,45 +90,60 @@ EOF
         path: |
           /tmp/ccache
           dl
-        key: ${{ runner.os }}-openwrt-${{ github.event.inputs.source_branch }}
+        key: ${{ runner.os }}-openwrt-${{ github.event.inputs.source_branch }}-${{ hashFiles('feeds.conf.default') }}
         restore-keys: |
-          ${{ runner.os }}-openwrt-
+          ${{ runner.os }}-openwrt-${{ github.event.inputs.source_branch }}-
 
-    - name: 准备构建环境
+    - name: 设置构建环境
       run: |
         ccache -M 5G
         ./scripts/feeds update -a
+        
+        # 验证关键包的来源
+        echo "🔍 验证关键包来源:"
+        for pkg in luci-base luci-mod-admin-full luci-theme-bootstrap dnsmasq firewall; do
+          if ./scripts/feeds list | grep -q " $pkg "; then
+            source=$(./scripts/feeds list | grep " $pkg " | head -1 | awk '{print $2}')
+            echo "📦 $pkg 来自: $source"
+          fi
+        done
+        
         ./scripts/feeds install -a
 
-    - name: 配置和构建
+    - name: 生成配置
       run: |
-        # 生成配置
-        {
-          echo "CONFIG_TARGET_${{ github.event.inputs.target_arch }}=y"
-          echo "CONFIG_TARGET_${{ github.event.inputs.target_arch }}_${{ github.event.inputs.device_model }}=y"
-          echo "CONFIG_CCACHE=y"
-          
-          if [ -n "${{ github.event.inputs.packages }}" ]; then
-            IFS=',' read -ra PKGS <<< "${{ github.event.inputs.packages }}"
-            for pkg in "${PKGS[@]}"; do
-              echo "CONFIG_PACKAGE_${pkg}=y"
-            done
-          fi
-        } > .config
+        echo "CONFIG_TARGET_${{ github.event.inputs.target_arch }}=y" > .config
+        echo "CONFIG_TARGET_${{ github.event.inputs.target_arch }}_${{ github.event.inputs.device_model }}=y" >> .config
+        echo "CONFIG_CCACHE=y" >> .config
+        
+        # 确保使用官方版本的关键包
+        echo "CONFIG_PACKAGE_luci=y" >> .config
+        echo "CONFIG_PACKAGE_luci-ssl=y" >> .config
+        
+        if [ -n "${{ github.event.inputs.packages }}" ]; then
+          IFS=',' read -ra PKGS <<< "${{ github.event.inputs.packages }}"
+          for pkg in "${PKGS[@]}"; do
+            echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+          done
+        fi
         
         make defconfig
-        make download -j$JOBS
-        
-        # 构建固件
+
+    - name: 下载依赖
+      run: make download -j$JOBS
+
+    - name: 构建固件
+      run: |
+        mkdir -p $BUILD_LOG_DIR
         if [ "${{ github.event.inputs.verbose_build }}" = "true" ]; then
-          make V=s -j$JOBS
+          make V=s -j$JOBS 2>&1 | tee $BUILD_LOG_DIR/build.log
         else
-          make -j$JOBS
+          make -j$JOBS 2>&1 | tee $BUILD_LOG_DIR/build.log
         fi
 
-    - name: 上传构建产物
-      if: success()
+    - name: 上传产物
       uses: actions/upload-artifact@v4
+      if: success()
       with:
         name: openwrt-${{ env.BUILD_DATE }}
         path: bin/targets/
@@ -134,4 +159,11 @@ EOF
           架构: ${{ github.event.inputs.target_arch }}
           型号: ${{ github.event.inputs.device_model }}
           分支: ${{ github.event.inputs.source_branch }}
+          Feeds 优先级: 官方 → coolsnowwolf → kenzo → lienol
         files: bin/targets/**/*.bin
+
+    - name: 失败诊断
+      if: failure()
+      run: |
+        echo "构建失败:"
+        tail -200 $BUILD_LOG_DIR/build.log 2>/dev/null || echo "无日志"
