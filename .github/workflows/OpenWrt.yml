@@ -59,7 +59,7 @@ jobs:
         ref: ${{ github.event.inputs.source_branch }}
         submodules: recursive
 
-    - name: 配置优化的 Feeds
+    - name: 配置 Feeds
       run: |
         cat > feeds.conf.default << 'EOF'
 src-git packages https://git.openwrt.org/feed/packages.git
@@ -99,8 +99,6 @@ EOF
         echo "CONFIG_TARGET_${{ github.event.inputs.target_arch }}=y" > .config
         echo "CONFIG_TARGET_${{ github.event.inputs.target_arch }}_${{ github.event.inputs.device_model }}=y" >> .config
         echo "CONFIG_CCACHE=y" >> .config
-        echo "CONFIG_PACKAGE_luci=y" >> .config
-        echo "CONFIG_PACKAGE_luci-ssl=y" >> .config
         
         if [ -n "${{ github.event.inputs.packages }}" ]; then
           IFS=',' read -ra PKGS <<< "${{ github.event.inputs.packages }}"
