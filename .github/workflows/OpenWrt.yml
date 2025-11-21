@@ -76,7 +76,7 @@ src-git kenzo https://github.com/kenzok8/openwrt-packages
 src-git small https://github.com/kenzok8/small
 src-git lienol https://github.com/Lienol/openwrt-package
 EOF
-        echo "✅ Feeds 配置完成 - 官方仓库优先级最高"
+        echo "Feeds 配置完成 - 官方仓库优先级最高"
 
     - name: 安装依赖
       run: |
@@ -100,11 +100,11 @@ EOF
         ./scripts/feeds update -a
         
         # 验证关键包的来源
-        echo "🔍 验证关键包来源:"
+        echo "验证关键包来源:"
         for pkg in luci-base luci-mod-admin-full luci-theme-bootstrap dnsmasq firewall; do
           if ./scripts/feeds list | grep -q " $pkg "; then
             source=$(./scripts/feeds list | grep " $pkg " | head -1 | awk '{print $2}')
-            echo "📦 $pkg 来自: $source"
+            echo "$pkg 来自: $source"
           fi
         done
         
@@ -159,7 +159,6 @@ EOF
           架构: ${{ github.event.inputs.target_arch }}
           型号: ${{ github.event.inputs.device_model }}
           分支: ${{ github.event.inputs.source_branch }}
-          Feeds 优先级: 官方 → coolsnowwolf → kenzo → lienol
         files: bin/targets/**/*.bin
 
     - name: 失败诊断
