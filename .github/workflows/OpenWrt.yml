@@ -136,7 +136,6 @@ jobs:
         if [ $ERROR_COUNT -gt 0 ]; then
           echo "构建失败: 发现 $ERROR_COUNT 个必需包缺失"
           echo "正在自动修复缺失包..."
-          # 自动添加缺失的必需包
           if ! grep -q "^CONFIG_PACKAGE_firewall=y" .config; then
             echo "CONFIG_PACKAGE_firewall=y" >> .config
             echo "已添加: firewall"
@@ -192,17 +191,25 @@ jobs:
         find bin/ -type f -name "*.bin" -o -name "*.img" -o -name "*.gz" | head -20
         ls -la bin/ || echo "bin目录不存在"
 
-    - name: 打包产物
+    - name: 打包软件包
       run: |
-        zip -r "openwrt-build-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}-${{ env.BUILD_DATE }}.zip" . \
-          -x "*.git*" "dl/*" "tmp/*" "build_dir/*" "staging_dir/*" "build_logs/*" "*.log" "logs/*" ".config.old"
+        if [ -d "bin/packages/" ]; then
+          zip -r "openwrt-packages-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}-${{ env.BUILD_DATE }}.zip" bin/packages/
+        else
+          echo "bin/packages/ 目录不存在，跳过打包软件包"
+        fi
+
+    - name: 打包固件文件
+      run: |
+        zip -r "openwrt-firmware-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}-${{ env.BUILD_DATE }}.zip" . \
+          -x "*.git*" "dl/*" "tmp/*" "build_dir/*" "staging_dir/*" "build_logs/*" "*.log" "logs/*" ".config.old" "bin/packages/*"
 
     - name: 上传产物
       uses: actions/upload-artifact@v4
       if: success() || failure()
       with:
         name: openwrt-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}-${{ env.BUILD_DATE }}
-        path: openwrt-build-*.zip
+        path: openwrt-firmware-*.zip
         retention-days: 7
 
     - name: 创建发布
@@ -216,4 +223,6 @@ jobs:
           目标架构: ${{ github.event.inputs.target_arch }}
           设备型号: ${{ github.event.inputs.device_model }}
           预装软件: ${{ github.event.inputs.packages }}
-        files: openwrt-build-*.zip
+        files: |
+          openwrt-firmware-*.zip
+          openwrt-packages-*.zip
