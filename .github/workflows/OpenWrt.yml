@@ -183,11 +183,9 @@ jobs:
       run: |
         mkdir -p build_logs
         echo "开始编译，使用详细输出模式..."
-        make -j1 V=s 2>&1 | tee build_logs/build.log || {
-          echo "编译失败，检查错误信息..."
-          grep -i "error\|failed" build_logs/build.log | head -30
-          exit 1
-        }
+        # 使用set -o pipefail确保编译错误立即中断
+        set -o pipefail
+        make -j1 V=s 2>&1 | tee build_logs/build.log
 
     - name: 检查输出
       run: |
