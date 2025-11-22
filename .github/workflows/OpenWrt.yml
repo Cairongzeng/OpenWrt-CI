@@ -21,7 +21,7 @@ on:
       packages:
         description: '预装软件包列表'
         required: false
-        default: 'luci,luci-theme-bootstrap,luci-i18n-base-zh-cn,luci-theme-argon,luci-app-ddns,luci-app-printer,luci-app-ramfree,luci-app-diskman,luci-app-appfilter,luci-app-tailscale,tailscale,tailscaled,ddns-scripts,p910nd,usbutils,parted,e2fsprogs'
+        default: 'luci luci-theme-bootstrap luci-i18n-base-zh-cn luci-theme-argon luci-app-ddns luci-app-printer luci-app-ramfree luci-app-diskman luci-app-appfilter luci-app-tailscale tailscale tailscaled ddns-scripts p910nd usbutils parted e2fsprogs luci-app-miot luci-app-dlnacast'
         type: string
       create_release:
         description: '发布到 GitHub Release'
@@ -88,18 +88,32 @@ jobs:
         echo "CONFIG_TARGET_${{ github.event.inputs.target_arch }}_${{ github.event.inputs.device_model }}=y" >> .config
         echo "CONFIG_CCACHE=y" >> .config
         
-        PACKAGES="${{ github.event.inputs.packages }}"
-        PACKAGES=$(echo "$PACKAGES" | sed 's/，/,/g')
+        # 基础包列表，确保始终有效
+        BASE_PACKAGES="luci luci-theme-bootstrap luci-i18n-base-zh-cn luci-theme-argon"
+        BASE_PACKAGES="$BASE_PACKAGES luci-app-ddns luci-app-printer luci-app-ramfree luci-app-diskman"
+        BASE_PACKAGES="$BASE_PACKAGES luci-app-appfilter luci-app-tailscale tailscale tailscaled"
+        BASE_PACKAGES="$BASE_PACKAGES ddns-scripts p910nd usbutils parted e2fsprogs"
+        BASE_PACKAGES="$BASE_PACKAGES luci-app-miot luci-app-dlnacast"
         
-        if [ -n "$PACKAGES" ]; then
-          echo "添加用户自定义包: $PACKAGES"
-          echo "$PACKAGES" | tr ',' '\n' | while read pkg; do
-            pkg_clean=$(echo "$pkg" | tr -d ' ')
-            if [ -n "$pkg_clean" ]; then
-              echo "CONFIG_PACKAGE_${pkg_clean}=y" >> .config
-            fi
-          done
+        # 合并用户输入的包和基础包
+        USER_PACKAGES="${{ github.event.inputs.packages }}"
+        USER_PACKAGES=$(echo "$USER_PACKAGES" | sed 's/，/,/g' | sed 's/,/ /g')
+        
+        if [ -n "$USER_PACKAGES" ]; then
+          ALL_PACKAGES="$BASE_PACKAGES $USER_PACKAGES"
+        else
+          ALL_PACKAGES="$BASE_PACKAGES"
         fi
+        
+        echo "最终包列表: $ALL_PACKAGES"
+        
+        # 添加包到配置
+        for pkg in $ALL_PACKAGES; do
+          pkg_clean=$(echo "$pkg" | tr -d ' ')
+          if [ -n "$pkg_clean" ]; then
+            echo "CONFIG_PACKAGE_${pkg_clean}=y" >> .config
+          fi
+        done
         
         make defconfig
 
@@ -117,9 +131,12 @@ jobs:
     - name: 编译固件
       run: |
         mkdir -p build_logs
-        echo "开始编译，使用详细输出模式..."
-        set -o pipefail
-        make -j1 V=s 2>&1 | tee build_logs/build.log
+        echo "开始编译，使用并行编译..."
+        if ! make -j$(nproc) V=1; then
+          echo "编译失败，保存详细日志..."
+          make -j1 V=s 2>&1 | tee build_logs/build.log
+          exit 1
+        fi
 
     - name: 打包软件包
       run: |
@@ -131,12 +148,18 @@ jobs:
 
     - name: 上传产物
       uses: actions/upload-artifact@v4
-      if: success() || failure()
+      if: success()
       with:
         name: openwrt-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}-${{ env.BUILD_DATE }}
-        path: |
-          bin/targets/${{ github.event.inputs.target_arch }}
-          .config
+        path: bin/targets/${{ github.event.inputs.target_arch }}
+        retention-days: 7
+
+    - name: 上传失败日志
+      uses: actions/upload-artifact@v4
+      if: failure()
+      with:
+        name: build-logs-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}-${{ env.BUILD_DATE }}
+        path: build_logs/
         retention-days: 7
 
     - name: 创建发布
@@ -149,7 +172,7 @@ jobs:
           源码分支: ${{ github.event.inputs.source_branch }}
           目标架构: ${{ github.event.inputs.target_arch }}
           设备型号: ${{ github.event.inputs.device_model }}
-          预装软件: ${{ github.event.inputs.packages }}
+          预装软件: $ALL_PACKAGES
         files: |
           bin/targets/${{ github.event.inputs.target_arch }}/**/*
           openwrt-packages-*.zip
