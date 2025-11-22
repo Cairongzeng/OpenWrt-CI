@@ -21,7 +21,7 @@ on:
       packages:
         description: '预装软件包列表'
         required: false
-        default: 'luci,luci-ssl,luci-theme-bootstrap,luci-i18n-base-zh-cn,luci-theme-argon,luci-app-ddns,luci-app-printer,luci-app-ramfree,luci-app-diskman,luci-app-appfilter,luci-app-tailscale,tailscale,tailscaled,ddns-scripts,p910nd,usbutils,parted,e2fsprogs'
+        default: 'luci,luci-theme-bootstrap,luci-i18n-base-zh-cn,luci-theme-argon,luci-app-ddns,luci-app-printer,luci-app-ramfree,luci-app-diskman,ddns-scripts,p910nd,usbutils,parted,e2fsprogs'
         type: string
       create_release:
         description: '发布到 GitHub Release'
@@ -182,8 +182,10 @@ jobs:
     - name: 编译固件
       run: |
         mkdir -p build_logs
-        make -j$(nproc) 2>&1 | tee build_logs/build.log || {
-          grep -i "error\|warn\|missing\|depends" build_logs/build.log | head -20
+        echo "开始编译，使用详细输出模式..."
+        make -j1 V=s 2>&1 | tee build_logs/build.log || {
+          echo "编译失败，检查错误信息..."
+          grep -i "error\|failed" build_logs/build.log | head -30
           exit 1
         }
 
@@ -200,9 +202,9 @@ jobs:
           echo "bin/packages/ 目录不存在，跳过打包软件包"
         fi
 
-    - name: 打包固件文件
+    - name: 打包完整构建目录
       run: |
-        zip -r "openwrt-firmware-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}-${{ env.BUILD_DATE }}.zip" . \
+        zip -r "openwrt-build-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}-${{ env.BUILD_DATE }}.zip" . \
           -x "*.git*" "dl/*" "tmp/*" "build_dir/*" "staging_dir/*" "build_logs/*" "*.log" "logs/*" ".config.old" "bin/packages/*"
 
     - name: 上传产物
@@ -210,7 +212,7 @@ jobs:
       if: success() || failure()
       with:
         name: openwrt-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}-${{ env.BUILD_DATE }}
-        path: openwrt-firmware-*.zip
+        path: openwrt-build-*.zip
         retention-days: 7
 
     - name: 创建发布
@@ -225,5 +227,5 @@ jobs:
           设备型号: ${{ github.event.inputs.device_model }}
           预装软件: ${{ github.event.inputs.packages }}
         files: |
-          openwrt-firmware-*.zip
+          openwrt-build-*.zip
           openwrt-packages-*.zip
