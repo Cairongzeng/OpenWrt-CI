@@ -21,7 +21,7 @@ on:
       packages:
         description: '预装软件包列表'
         required: false
-        default: 'luci,luci-ssl,luci-theme-bootstrap,luci-i18n-base-zh-cn'
+        default: 'luci,luci-ssl,luci-theme-bootstrap,luci-i18n-base-zh-cn,luci-theme-argon,luci-app-ddns,luci-app-printer,luci-app-ramfree,luci-app-diskman,luci-app-appfilter,luci-app-tailscale,tailscale,tailscaled,ddns-scripts,p910nd,usbutils,parted,e2fsprogs'
         type: string
       create_release:
         description: '发布到 GitHub Release'
@@ -64,7 +64,7 @@ jobs:
         sudo apt-get install -y \
           build-essential clang flex bison g++ gawk gcc-multilib gettext git \
           libncurses5-dev libssl-dev python3-setuptools rsync unzip zlib1g-dev \
-          file wget ccache zip libev-dev libpam0g-dev libtirpc-dev liblzma-dev libsnmp-dev
+          file wget ccache zip
 
     - name: 配置缓存
       uses: actions/cache@v4
@@ -82,14 +82,71 @@ jobs:
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
-    - name: 生成配置
+    - name: 生成基础配置
       run: |
         echo "CONFIG_TARGET_${{ github.event.inputs.target_arch }}=y" > .config
         echo "CONFIG_TARGET_${{ github.event.inputs.target_arch }}_${{ github.event.inputs.device_model }}=y" >> .config
         echo "CONFIG_CCACHE=y" >> .config
+        make defconfig
+
+    - name: 检查默认包配置
+      run: |
+        echo "官方默认包配置检查"
+        echo "目标设备: ${{ github.event.inputs.target_arch }}/${{ github.event.inputs.device_model }}"
         
+        ERROR_COUNT=0
+        
+        check_package() {
+          if ! grep -q "^CONFIG_PACKAGE_$1=y" .config; then
+            echo "错误: 缺失必需包 $1"
+            return 1
+          else
+            echo "通过: $1"
+            return 0
+          fi
+        }
+        
+        echo ""
+        echo "核心系统包检查:"
+        check_package "base-files" || ERROR_COUNT=$((ERROR_COUNT+1))
+        check_package "busybox" || ERROR_COUNT=$((ERROR_COUNT+1))
+        check_package "procd" || ERROR_COUNT=$((ERROR_COUNT+1))
+        check_package "ubox" || ERROR_COUNT=$((ERROR_COUNT+1))
+        check_package "ubus" || ERROR_COUNT=$((ERROR_COUNT+1))
+        check_package "uci" || ERROR_COUNT=$((ERROR_COUNT+1))
+        check_package "netifd" || ERROR_COUNT=$((ERROR_COUNT+1))
+        check_package "firewall" || ERROR_COUNT=$((ERROR_COUNT+1))
+        
+        echo ""
+        echo "网络服务包检查:"
+        check_package "dnsmasq" || ERROR_COUNT=$((ERROR_COUNT+1))
+        check_package "dropbear" || ERROR_COUNT=$((ERROR_COUNT+1))
+        check_package "odhcpd" || ERROR_COUNT=$((ERROR_COUNT+1))
+        
+        echo ""
+        echo "包管理检查:"
+        check_package "opkg" || ERROR_COUNT=$((ERROR_COUNT+1))
+        check_package "ca-bundle" || ERROR_COUNT=$((ERROR_COUNT+1))
+        
+        echo ""
+        echo "内核模块统计:"
+        grep "^CONFIG_PACKAGE_kmod-" .config | wc -l | xargs echo "内核模块数量:"
+        
+        echo ""
+        if [ $ERROR_COUNT -gt 0 ]; then
+          echo "构建失败: 发现 $ERROR_COUNT 个必需包缺失"
+          exit 1
+        else
+          echo "检查通过: 所有必需包都存在"
+        fi
+
+    - name: 添加用户包配置
+      run: |
         PACKAGES="${{ github.event.inputs.packages }}"
+        PACKAGES=$(echo "$PACKAGES" | sed 's/，/,/g')
+        
         if [ -n "$PACKAGES" ]; then
+          echo "添加用户自定义包: $PACKAGES"
           echo "$PACKAGES" | tr ',' '\n' | while read pkg; do
             pkg_clean=$(echo "$pkg" | tr -d ' ')
             if [ -n "$pkg_clean" ]; then
