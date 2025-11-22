@@ -138,12 +138,13 @@ jobs:
           exit 1
         fi
 
-    - name: 打包软件包
+    - name: 打包目标架构软件包
       run: |
-        if [ -d "bin/packages/" ]; then
-          zip -r "openwrt-packages-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}-${{ env.BUILD_DATE }}.zip" bin/packages/
+        if [ -d "bin/packages/${{ github.event.inputs.target_arch }}" ]; then
+          zip -r "openwrt-${{ github.event.inputs.target_arch }}-packages-${{ env.BUILD_DATE }}.zip" "bin/packages/${{ github.event.inputs.target_arch }}/"
+          echo "已创建目标架构软件包 ZIP 文件"
         else
-          echo "bin/packages/ 目录不存在，跳过打包软件包"
+          echo "bin/packages/${{ github.event.inputs.target_arch }} 目录不存在，跳过打包软件包"
         fi
 
     - name: 上传产物
@@ -151,7 +152,7 @@ jobs:
       if: success()
       with:
         name: openwrt-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}-${{ env.BUILD_DATE }}
-        path: bin/targets/${{ github.event.inputs.target_arch }}
+        path: bin/targets/${{ github.event.inputs.target_arch }}/${{ github.event.inputs.device_model }}
         retention-days: 7
 
     - name: 上传失败日志
@@ -174,5 +175,5 @@ jobs:
           设备型号: ${{ github.event.inputs.device_model }}
           预装软件: $ALL_PACKAGES
         files: |
-          bin/targets/${{ github.event.inputs.target_arch }}/**/*
-          openwrt-packages-*.zip
+          bin/targets/${{ github.event.inputs.target_arch }}/${{ github.event.inputs.device_model }}/**/*
+          openwrt-${{ github.event.inputs.target_arch }}-packages-${{ env.BUILD_DATE }}.zip
