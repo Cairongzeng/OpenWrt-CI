@@ -21,7 +21,7 @@ on:
       packages:
         description: '预装软件包列表'
         required: false
-        default: 'luci,luci-theme-bootstrap,luci-i18n-base-zh-cn,luci-theme-argon,luci-app-ddns,luci-app-printer,luci-app-ramfree,luci-app-diskman,ddns-scripts,p910nd,usbutils,parted,e2fsprogs'
+        default: 'luci,luci-theme-bootstrap,luci-i18n-base-zh-cn,luci-theme-argon,luci-app-ddns,luci-app-printer,luci-app-ramfree,luci-app-diskman,luci-app-appfilter,luci-app-tailscale,tailscale,tailscaled,ddns-scripts,p910nd,usbutils,parted,e2fsprogs'
         type: string
       create_release:
         description: '发布到 GitHub Release'
@@ -55,9 +55,8 @@ jobs:
 
     - name: 配置软件源
       run: |
-        # echo 'src-git kenzo https://github.com/kenzok8/openwrt-packages' >> feeds.conf.default
-        # echo 'src-git small https://github.com/kenzok8/small' >> feeds.conf.default
-        echo "已注释第三方软件源"
+        echo 'src-git kenzo https://github.com/kenzok8/openwrt-packages' >> feeds.conf.default
+        echo 'src-git small https://github.com/kenzok8/small' >> feeds.conf.default
 
     - name: 安装依赖
       run: |
@@ -83,76 +82,12 @@ jobs:
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
-    - name: 生成基础配置
+    - name: 生成配置
       run: |
         echo "CONFIG_TARGET_${{ github.event.inputs.target_arch }}=y" > .config
         echo "CONFIG_TARGET_${{ github.event.inputs.target_arch }}_${{ github.event.inputs.device_model }}=y" >> .config
         echo "CONFIG_CCACHE=y" >> .config
-        make defconfig
-
-    - name: 检查默认包配置
-      run: |
-        echo "官方默认包配置检查"
-        echo "目标设备: ${{ github.event.inputs.target_arch }}/${{ github.event.inputs.device_model }}"
         
-        ERROR_COUNT=0
-        
-        check_package() {
-          if grep -q "^CONFIG_PACKAGE_$1=y" .config; then
-            echo "通过: $1"
-            return 0
-          else
-            echo "错误: 缺失必需包 $1"
-            return 1
-          fi
-        }
-        
-        echo ""
-        echo "核心系统包检查:"
-        check_package "base-files" || ERROR_COUNT=$((ERROR_COUNT+1))
-        check_package "busybox" || ERROR_COUNT=$((ERROR_COUNT+1))
-        check_package "procd" || ERROR_COUNT=$((ERROR_COUNT+1))
-        check_package "ubox" || ERROR_COUNT=$((ERROR_COUNT+1))
-        check_package "ubus" || ERROR_COUNT=$((ERROR_COUNT+1))
-        check_package "uci" || ERROR_COUNT=$((ERROR_COUNT+1))
-        check_package "netifd" || ERROR_COUNT=$((ERROR_COUNT+1))
-        check_package "firewall" || ERROR_COUNT=$((ERROR_COUNT+1))
-        
-        echo ""
-        echo "网络服务包检查:"
-        check_package "dnsmasq" || ERROR_COUNT=$((ERROR_COUNT+1))
-        check_package "dropbear" || ERROR_COUNT=$((ERROR_COUNT+1))
-        check_package "odhcpd" || ERROR_COUNT=$((ERROR_COUNT+1))
-        
-        echo ""
-        echo "包管理检查:"
-        check_package "opkg" || ERROR_COUNT=$((ERROR_COUNT+1))
-        check_package "ca-bundle" || ERROR_COUNT=$((ERROR_COUNT+1))
-        
-        echo ""
-        echo "内核模块统计:"
-        grep "^CONFIG_PACKAGE_kmod-" .config | wc -l | xargs echo "内核模块数量:"
-        
-        echo ""
-        if [ $ERROR_COUNT -gt 0 ]; then
-          echo "构建失败: 发现 $ERROR_COUNT 个必需包缺失"
-          echo "正在自动修复缺失包..."
-          if ! grep -q "^CONFIG_PACKAGE_firewall=y" .config; then
-            echo "CONFIG_PACKAGE_firewall=y" >> .config
-            echo "已添加: firewall"
-          fi
-          if ! grep -q "^CONFIG_PACKAGE_odhcpd=y" .config; then
-            echo "CONFIG_PACKAGE_odhcpd=y" >> .config
-            echo "已添加: odhcpd"
-          fi
-          echo "重新生成配置..."
-          make defconfig
-        else
-          echo "检查通过: 所有必需包都存在"
-        fi
-
-    - name: 添加用户包配置
-      run: |
         PACKAGES="${{ github.event.inputs.packages }}"
         PACKAGES=$(echo "$PACKAGES" | sed 's/，/,/g')
         
@@ -183,14 +118,8 @@ jobs:
       run: |
         mkdir -p build_logs
         echo "开始编译，使用详细输出模式..."
-        # 使用set -o pipefail确保编译错误立即中断
         set -o pipefail
         make -j1 V=s 2>&1 | tee build_logs/build.log
-
-    - name: 检查输出
-      run: |
-        find bin/ -type f -name "*.bin" -o -name "*.img" -o -name "*.gz" | head -20
-        ls -la bin/ || echo "bin目录不存在"
 
     - name: 打包软件包
       run: |
@@ -200,17 +129,14 @@ jobs:
           echo "bin/packages/ 目录不存在，跳过打包软件包"
         fi
 
-    - name: 打包完整构建目录
-      run: |
-        zip -r "openwrt-build-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}-${{ env.BUILD_DATE }}.zip" . \
-          -x "*.git*" "dl/*" "tmp/*" "build_dir/*" "staging_dir/*" "build_logs/*" "*.log" "logs/*" ".config.old" "bin/packages/*"
-
     - name: 上传产物
       uses: actions/upload-artifact@v4
       if: success() || failure()
       with:
         name: openwrt-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.device_model }}-${{ env.BUILD_DATE }}
-        path: openwrt-build-*.zip
+        path: |
+          bin/targets/${{ github.event.inputs.target_arch }}
+          .config
         retention-days: 7
 
     - name: 创建发布
@@ -225,5 +151,5 @@ jobs:
           设备型号: ${{ github.event.inputs.device_model }}
           预装软件: ${{ github.event.inputs.packages }}
         files: |
-          openwrt-build-*.zip
+          bin/targets/${{ github.event.inputs.target_arch }}/**/*
           openwrt-packages-*.zip
