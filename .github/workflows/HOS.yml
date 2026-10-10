@@ -12,7 +12,7 @@ on:
       source_branch:
         description: '源码分支'
         required: true
-        default: 'openwrt-25.12'
+        default: 'main'
         type: string
       target:
         description: '设备架构'
