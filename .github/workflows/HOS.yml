@@ -27,7 +27,7 @@ on:
       profile:
         description: '设备型号'
         required: true
-        default: 'nokia_xg-040g-md'
+        default: 'nokia_xg-040g-md-ubi'
         type: string
       use_hos:
         description: '启用HOS'
@@ -380,7 +380,7 @@ jobs:
         run: |
           cd openwrt
           make download -j$(nproc) || make download -j1 V=s
-          make -j$(nproc) V=s
+          make -j2 V=s
 
       - name: 上传补丁拒绝文件
         if: failure()
